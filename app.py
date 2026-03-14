@@ -28,6 +28,12 @@ app = Flask(__name__)
 app.template_folder = 'htdocs'
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
 
+# Ensure instance directory exists for SQLite databases
+import os
+instance_path = os.path.join(app.root_path, 'instance')
+os.makedirs(instance_path, exist_ok=True)
+app.logger.info(f"Ensured instance directory exists: {instance_path}")
+
 def get_database_urls():
     """Get database URLs at runtime to ensure environment variables are available"""
     # Debug: Log all MySQL-related environment variables
@@ -40,8 +46,8 @@ def get_database_urls():
         mysql_url = mysql_url.replace('mysql://', 'mysql+pymysql://', 1)
 
     # SQLite fallback databases (only for development/local testing)
-    sqlite_user_db_url = 'sqlite:///doran.db'
-    sqlite_chatbot_db_url = 'sqlite:///chatbot.db'
+    sqlite_user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+    sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
 
     def construct_railway_mysql_url():
         """Construct MySQL URL strictly from Railway env vars (no hardcoded fallbacks)"""
@@ -69,8 +75,8 @@ def get_database_urls():
         user_db_url = mysql_url
         chatbot_db_url = mysql_url
     else:
-        user_db_url = 'sqlite:///instance/doran.db'
-        chatbot_db_url = 'sqlite:///instance/chatbot.db'
+        user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+        chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
     app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
 
     return user_db_url, chatbot_db_url
@@ -505,10 +511,15 @@ def login():
             session['guest_username'] = username
             session['user_type'] = 'guest'
             session['logged_in'] = True
-            # Log guest login
-            login_log = LoginLog(user_type='guest', identifier=username)
-            db.session.add(login_log)
-            db.session.commit()
+            try:
+                # Log guest login
+                login_log = LoginLog(user_type='guest', identifier=username)
+                db.session.add(login_log)
+                db.session.commit()
+                app.logger.info(f"Guest login logged: {username}")
+            except Exception as e:
+                app.logger.error(f"Failed to log guest login: {str(e)}")
+                db.session.rollback()
             flash('Guest login successful!', 'success')
             return redirect(url_for('chat'))
         else:
@@ -532,10 +543,15 @@ def login():
                 session['user_id'] = user.id
                 session['user_type'] = 'user'
                 session['logged_in'] = True
-                # Log user login
-                login_log = LoginLog(user_type='user', identifier=user.email)
-                db.session.add(login_log)
-                db.session.commit()
+                try:
+                    # Log user login
+                    login_log = LoginLog(user_type='user', identifier=user.email)
+                    db.session.add(login_log)
+                    db.session.commit()
+                    app.logger.info(f"User login logged: {user.email}")
+                except Exception as e:
+                    app.logger.error(f"Failed to log user login: {str(e)}")
+                    db.session.rollback()
                 flash('Login successful!', 'success')
                 return redirect(url_for('chat'))
 
