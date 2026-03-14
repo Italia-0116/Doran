@@ -43,33 +43,36 @@ def get_database_urls():
     sqlite_user_db_url = 'sqlite:///doran.db'
     sqlite_chatbot_db_url = 'sqlite:///chatbot.db'
 
-    def construct_railway_mysql_url(database_name='railway'):
-        """Construct MySQL URL from Railway environment variables or hardcoded Railway credentials"""
-        # Try different possible environment variable names
-        host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST') or 'trolley.proxy.rlwy.net'
-        port = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT') or 10349
-        user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER') or 'root'
-        password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD') or 'dDDFLZWyupsuUkbFDIGveYZFXxzAEIEA'
+    def construct_railway_mysql_url():
+        """Construct MySQL URL strictly from Railway env vars (no hardcoded fallbacks)"""
+        host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
+        port_str = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
+        user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
+        password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD')
+        db_name = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or 'railway'
 
-        # Get database name from environment or use default
-        db_name = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or database_name
+        if not all([host, port_str, user, password]):
+            app.logger.warning("Missing required Railway MySQL env vars")
+            return None
 
-        app.logger.info(f"Railway MySQL vars - host: {host}, port: {port}, user: {user}, password: {'***' if password else None}, db: {db_name}")
+        port = int(port_str)
+        # Fix for external IPv6: use proxy if internal host
+        if 'railway.internal' in host:
+            host = 'trolley.proxy.rlwy.net'
 
-        if host and port and user and password:
-            url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}'
-            app.logger.info(f"Constructed Railway MySQL URL: {url.replace(password, '***')}")
-            return url
-        app.logger.warning("Railway MySQL environment variables not complete")
-        return None
+        url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4'
+        app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name}")
+        return url
 
-    # Use the correct hardcoded database URL
-    correct_db_url = 'mysql+pymysql://root:dDDFLZWyupsuUkbFDIGveYZFXxzAEIEA@mysql.railway.internal:3306/railway'
-    user_db_url = correct_db_url
-    chatbot_db_url = correct_db_url
-    app.logger.info("Using corrected hardcoded MySQL URL for both user and chatbot databases")
-
+    mysql_url = construct_railway_mysql_url()
+    if mysql_url:
+        user_db_url = mysql_url
+        chatbot_db_url = mysql_url
+    else:
+        user_db_url = 'sqlite:///instance/doran.db'
+        chatbot_db_url = 'sqlite:///instance/chatbot.db'
     app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
+
     return user_db_url, chatbot_db_url
 
 # Get database URLs at runtime
@@ -155,18 +158,20 @@ railway_engine = RailwayMySQLEngine(user_db_url)
 # Use the custom engine for all database operations
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
-    'pool_recycle': 30,  # Less aggressive recycling
+    'pool_recycle': 30,
     'pool_size': 1,
     'max_overflow': 0,
-    'pool_timeout': 30,  # Increased timeout
+    'pool_timeout': 30,
     'pool_reset_on_return': 'rollback',
     'connect_args': {
-        'connect_timeout': 30,  # Increased connection timeout
-        'read_timeout': 30,     # Increased read timeout
-        'write_timeout': 30,    # Increased write timeout
+        'connect_timeout': 30,
+        'read_timeout': 30,
+        'write_timeout': 30,
         'autocommit': True,
         'charset': 'utf8mb4',
         'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
+        # Fix caching_sha2_password auth (Railway MySQL 8+)
+        'client_flag': 4,  # CLIENT_SSL
     }
 }
 
