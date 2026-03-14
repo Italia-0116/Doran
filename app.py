@@ -156,6 +156,18 @@ class RailwayMySQLEngine:
 railway_engine = RailwayMySQLEngine(user_db_url)
 
 # Use the custom engine for all database operations
+# Conditional connect_args for MySQL only (SQLite doesn't support)
+is_mysql = user_db_url.startswith('mysql')
+mysql_connect_args = {
+    'connect_timeout': 30,
+    'read_timeout': 30,
+    'write_timeout': 30,
+    'autocommit': True,
+    'charset': 'utf8mb4',
+    'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
+    'client_flag': 4,  # caching_sha2_password
+} if is_mysql else {}
+
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 30,
@@ -163,16 +175,7 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'max_overflow': 0,
     'pool_timeout': 30,
     'pool_reset_on_return': 'rollback',
-    'connect_args': {
-        'connect_timeout': 30,
-        'read_timeout': 30,
-        'write_timeout': 30,
-        'autocommit': True,
-        'charset': 'utf8mb4',
-        'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
-        # Fix caching_sha2_password auth (Railway MySQL 8+)
-        'client_flag': 4,  # CLIENT_SSL
-    }
+    'connect_args': mysql_connect_args
 }
 
 # Configure binds for multiple databases
