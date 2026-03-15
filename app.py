@@ -98,7 +98,7 @@ app.config['CHATBOT_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.root_path, 
 
 # Use the custom engine for all database operations
 # Conditional connect_args for MySQL only (SQLite doesn't support)
-is_mysql = user_db_url.startswith('mysql')
+is_mysql = app.config['SQLALCHEMY_DATABASE_URI'].startswith('mysql')
 mysql_connect_args = {
     'connect_timeout': 30,
     'read_timeout': 30,
