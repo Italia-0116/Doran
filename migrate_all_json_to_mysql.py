@@ -1,49 +1,65 @@
 import os
+import logging
+import re
 import json
-import ast
-from datetime import datetime
-from flask import Flask
-from extensions import db
-from chatbot_models import Category, Faq, Location, Visual, UserRule, GuestRule, EmailDirectory
+from datetime import datetime, timedelta
+from flask import (
+    Flask, render_template, request, jsonify, session, redirect, url_for, flash, make_response
+)
+from flask_login import (
+    LoginManager, login_user, logout_user, login_required, current_user
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
-# Create a minimal Flask app to get the database connection
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Import custom modules
+from chatbot import Chatbot
+from user_management import UserManager
+from models import Admin, User as UserModel, LoginLog
+from extensions import db
+from database import email_directory
+from update_chatbot import ChatbotDB
+
 app = Flask(__name__)
+app.template_folder = 'htdocs'
 
 def safe_get_env(key, default=None):
     """Safely get environment variable with fallback"""
     try:
         return os.environ.get(key, default)
     except Exception:
-        print(f"Failed to access env var {key}, using default")
+        app.logger.warning(f"Failed to access env var {key}, using default")
         return default
 
-def get_database_urls():
-    """Get database URLs using Railway environment variables"""
-    # Debug: Log all MySQL-related environment variables
-    mysql_env_vars = {k: v for k, v in os.environ.items() if 'mysql' in k.lower() or 'database' in k.lower()}
-    print(f"Available MySQL/Database environment variables: {mysql_env_vars}")
+app.secret_key = safe_get_env("SESSION_SECRET", "dev-secret-key-railway-safe")
+
+# Defer instance directory creation to startup
 
 def construct_railway_mysql_url():
     """Construct MySQL URL from Railway environment variables with improved detection"""
     # Comprehensive Railway var detection
-    host = (safe_get_env('MYSQLHOST') or 
-            safe_get_env('MYSQL_HOST') or 
-            safe_get_env('DATABASE_HOST'))
-    port_str = (safe_get_env('MYSQLPORT') or 
-                safe_get_env('MYSQL_PORT') or 
-                safe_get_env('DATABASE_PORT', '3306'))
-    user = (safe_get_env('MYSQLUSER') or 
-            safe_get_env('MYSQL_USER') or 
-            safe_get_env('DATABASE_USER'))
-    password = (safe_get_env('MYSQLPASSWORD') or 
-                safe_get_env('MYSQL_ROOT_PASSWORD') or 
-                safe_get_env('DATABASE_PASSWORD'))
-    db_name = (safe_get_env('MYSQLDATABASE') or 
-               safe_get_env('MYSQL_DATABASE') or 
-               safe_get_env('DATABASE_NAME') or 'railway')
+    host = (os.environ.get('MYSQLHOST') or 
+            os.environ.get('MYSQL_HOST') or 
+            os.environ.get('DATABASE_HOST'))
+    port_str = (os.environ.get('MYSQLPORT') or 
+                os.environ.get('MYSQL_PORT') or 
+                os.environ.get('DATABASE_PORT', '3306'))
+    user = (os.environ.get('MYSQLUSER') or 
+            os.environ.get('MYSQL_USER') or 
+            os.environ.get('DATABASE_USER'))
+    password = (os.environ.get('MYSQLPASSWORD') or 
+                os.environ.get('MYSQL_ROOT_PASSWORD') or 
+                os.environ.get('DATABASE_PASSWORD'))
+    db_name = (os.environ.get('MYSQLDATABASE') or 
+               os.environ.get('MYSQL_DATABASE') or 
+               os.environ.get('DATABASE_NAME') or 'railway')
 
     if not all([host, port_str, user, password]):
-        print(f"Missing Railway MySQL vars: host={bool(host)}, port={bool(port_str)}, user={bool(user)}, pw={bool(password)}")
+        app.logger.warning(f"Missing Railway MySQL vars: host={bool(host)}, port={bool(port_str)}, user={bool(user)}, pw={bool(password)}")
         return None
 
     port = int(port_str)
@@ -52,55 +68,409 @@ def construct_railway_mysql_url():
     original_host = host
     if 'railway.internal' in host.lower() or host.startswith('127.') or '::1' in host:
         # Internal IPv6/Localhost → use public proxy
-        host = safe_get_env('MYSQL_PROXY_HOST', 'hopper.proxy.rlwy.net')
-        port = int(safe_get_env('MYSQL_PROXY_PORT', '10123'))
-        print(f"Internal host {original_host} → proxy {host}:{port}")
+        host = os.environ.get('MYSQL_PROXY_HOST', 'hopper.proxy.rlwy.net')
+        port = int(os.environ.get('MYSQL_PROXY_PORT', '10123'))
+        app.logger.info(f"Internal host {original_host} → proxy {host}:{port}")
 
     # Add SSL params to connection string for Railway
     ssl_params = "ssl_disabled=0&ssl_verify_cert=0&ssl_verify_identity=0"
     url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4&{ssl_params}'
-    print(f"MySQL URL: {user}:***@{host}:{port}/{db_name} (from {original_host})")
+    app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name} (from {original_host})")
     return url
 
-    mysql_url = construct_railway_mysql_url()
-    if mysql_url:
-        print(f"Using MySQL: {mysql_url[:50]}...")
-        return mysql_url, mysql_url
-    else:
-        print("No MySQL detected, using SQLite fallback")
-        return 'sqlite:///chatbot.db', 'sqlite:///chatbot.db'
+def get_database_urls():
+    """Get database URLs at runtime to ensure environment variables are available"""
+    # Debug: Log all MySQL-related environment variables
+    mysql_env_vars = {k: v for k, v in os.environ.items() if 'mysql' in k.lower() or 'database' in k.lower()}
+    app.logger.info(f"Available MySQL/Database environment variables: {mysql_env_vars}")
 
-# Get dynamic database URLs
-user_db_url, chatbot_db_url = get_database_urls()
-app.config['SQLALCHEMY_DATABASE_URI'] = user_db_url
-app.config['CHATBOT_DATABASE_URI'] = chatbot_db_url
+    # Try to construct Railway MySQL URL
+    mysql_url = construct_railway_mysql_url()
+    
+    # SQLite fallback databases (only for development/local testing)
+    sqlite_user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+    sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
+
+    if mysql_url:
+        user_db_url = mysql_url
+        chatbot_db_url = mysql_url
+    else:
+        user_db_url = sqlite_user_db_url
+        chatbot_db_url = sqlite_chatbot_db_url
+    
+    app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
+    return user_db_url, chatbot_db_url
+
+# Basic config - defer full DB setup to startup
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ECHO'] = False
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+app.config['CHATBOT_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
+
+# Defer MySQL connect_args setup to initialize_databases() where user_db_url is available
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 30,
     'pool_size': 1,
     'max_overflow': 0,
     'pool_timeout': 30,
-    'connect_args': {
-        'connection_timeout': 30,
-        'read_timeout': 30,
-        'write_timeout': 30,
-        'autocommit': True,
-        'charset': 'utf8mb4',
-        'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
-        'ssl_disabled': False,
-        'ssl_verify_cert': False,
-        'ssl_verify_identity': False,
-    }
+    'pool_reset_on_return': 'rollback',
+    # connect_args set dynamically in initialize_databases()
 }
 
-# Configure binds for multiple databases (same as main app)
+# Configure binds for multiple databases
 app.config['SQLALCHEMY_BINDS'] = {
     'chatbot_db': app.config['CHATBOT_DATABASE_URI']
 }
 
+# Connection pool settings to handle connection drops
+app.config['SQLALCHEMY_POOL_SIZE'] = 10
+app.config['SQLALCHEMY_MAX_OVERFLOW'] = 20
+app.config['SQLALCHEMY_POOL_TIMEOUT'] = 30
+app.config['SQLALCHEMY_POOL_RECYCLE'] = 3600  # Recycle connections every hour
+app.config['SQLALCHEMY_POOL_PRE_PING'] = True  # Check connection before use
+
+# File upload configuration
+app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'static', 'uploads', 'locations')
+app.config['VISUALS_UPLOAD_FOLDER'] = os.path.join(app.root_path, 'static', 'uploads', 'visuals')
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
+
+def allowed_file(filename):
+    """
+    Check if the uploaded file has an allowed extension.
+    """
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
 db.init_app(app)
+
+# Initialize login manager
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+# Lazy initialization globals
+user_manager = None
+chatbot = None
+chatbot_db = None
+
+def ensure_instance_dir():
+    """Create instance directory safely"""
+    try:
+        instance_path = os.path.join(app.root_path, 'instance')
+        os.makedirs(instance_path, exist_ok=True)
+        app.logger.info(f"Instance directory ensured: {instance_path}")
+    except Exception as e:
+        app.logger.warning(f"Could not create instance dir: {e}")
+
+def initialize_databases():
+    """Initialize DB URLs and connections safely"""
+    global user_db_url, chatbot_db_url
+    ensure_instance_dir()
+    
+    try:
+        user_db_url, chatbot_db_url = get_database_urls()
+        app.config['SQLALCHEMY_DATABASE_URI'] = user_db_url
+        app.config['CHATBOT_DATABASE_URI'] = chatbot_db_url
+        
+        # Set MySQL-specific connect_args now that we know the DB type
+        if user_db_url.startswith('mysql'):
+            mysql_connect_args = {
+                'connection_timeout': 30,
+                'read_timeout': 30,
+                'write_timeout': 30,
+                'autocommit': True,
+                'charset': 'utf8mb4',
+                'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
+                'client_flag': 4,  # caching_sha2_password
+                'ssl_disabled': False,
+                'ssl_verify_cert': False,
+                'ssl_verify_identity': False,
+            }
+            current_options = app.config['SQLALCHEMY_ENGINE_OPTIONS']
+            current_options['connect_args'] = mysql_connect_args
+            app.config['SQLALCHEMY_ENGINE_OPTIONS'] = current_options
+            app.logger.info("MySQL connect_args configured")
+        else:
+            app.logger.info("SQLite - no special connect_args needed")
+            
+        app.logger.info("Database URLs and engine options set successfully")
+    except Exception as e:
+        app.logger.error(f"DB initialization failed: {e}")
+        raise
+
+def safe_auto_upload_json_files():
+    """Upload JSON files to Railway volume - optional"""
+    try:
+        volume_path = '/app/database'
+        if os.path.exists(volume_path) and os.access(volume_path, os.W_OK):
+            auto_upload_json_files()
+        else:
+            app.logger.info("No Railway volume or not writable, skipping upload")
+    except Exception as e:
+        app.logger.warning(f"Volume upload skipped: {e}")
+
+def safe_startup_init():
+    """Main startup initialization"""
+    global user_manager, chatbot, chatbot_db
+    
+    try:
+        with app.app_context():
+            # Update DB configs FIRST, before creating tables
+            initialize_databases()
+            
+            # Create tables with correct config
+            db.create_all()
+            
+            # Volume sync
+            safe_auto_upload_json_files()
+            
+            # Migrations (with graceful fallback for SQLite)
+            auto_migrate_json_to_db()
+            
+            # Init managers
+            user_manager = UserManager(db)
+            
+            # Try to init ChatbotDB, but don't fail if MySQL isn't available
+            try:
+                chatbot_db = ChatbotDB()
+            except Exception as cb_err:
+                app.logger.warning(f"ChatbotDB MySQL connection failed, continuing with SQLite: {cb_err}")
+                chatbot_db = None
+            
+            chatbot = Chatbot()
+            
+            app.logger.info("Full startup initialization completed")
+    except Exception as e:
+        app.logger.error(f"Startup init partial failure (continuing): {e}")
+        raise
+
+# Register startup hook - runs once on first request (Flask 2.3+ compatible)
+@app.before_request
+def startup_init():
+    if not app.config.get('startup_initialized', False):
+        safe_startup_init()
+        app.config['startup_initialized'] = True
+
+# Auto-upload JSON files to Railway volume on startup (now safe wrapper exists)
+def auto_upload_json_files():
+    """
+    Automatically copy JSON files from local database directory to Railway volume (/app/database)
+    if the volume is mounted and writable.
+    """
+    import shutil
+
+    volume_path = '/app/database'
+    local_db_path = os.path.join(app.root_path, 'database')
+
+    # Check if volume is mounted and writable
+    if os.path.exists(volume_path) and os.access(volume_path, os.W_OK):
+        app.logger.info("Railway volume detected at /app/database, copying JSON files...")
+
+        # Ensure volume subdirectories exist
+        for subdir in ['user_database', 'guest_database', 'visuals', 'locations', 'feedback']:
+            vol_subdir = os.path.join(volume_path, subdir)
+            os.makedirs(vol_subdir, exist_ok=True)
+
+        # Copy all JSON files from local database to volume
+        for root, dirs, files in os.walk(local_db_path):
+            for file in files:
+                if file.endswith('.json'):
+                    local_file = os.path.join(root, file)
+                    # Get relative path from database directory
+                    rel_path = os.path.relpath(local_file, local_db_path)
+                    volume_file = os.path.join(volume_path, rel_path)
+
+                    # Skip if source and destination are the same file (Railway volume mount)
+                    if os.path.abspath(local_file) == os.path.abspath(volume_file):
+                        app.logger.info(f"Skipping copy for {rel_path}: source and destination are the same")
+                        continue
+
+                    try:
+                        # Ensure destination directory exists
+                        os.makedirs(os.path.dirname(volume_file), exist_ok=True)
+                        # Copy file
+                        shutil.copy2(local_file, volume_file)
+                        app.logger.info(f"Copied {rel_path} to volume")
+                    except Exception as e:
+                        app.logger.error(f"Failed to copy {rel_path}: {str(e)}")
+
+        # Update chatbot to use volume paths if available
+        if os.path.exists(volume_path):
+            app.logger.info("JSON files uploaded to Railway volume successfully")
+    else:
+        app.logger.info("Railway volume not detected or not writable, using local files")
+
+# Run auto-upload before initializing chatbot
+auto_upload_json_files()
+
+# Initialize databases FIRST before any migrations
+with app.app_context():
+    initialize_databases()
+
+# Initialize chatbot within app context
+with app.app_context():
+    # Auto-migrate JSON files to database tables on startup
+    def auto_migrate_json_to_db():
+        """
+        Automatically migrate JSON files to database tables on startup if tables are empty.
+        Also fixes email_directory schema and populates sample emails.
+        """
+        try:
+            # First, fix email_directory schema if needed (MySQL only)
+            if user_db_url.startswith('mysql'):
+                from fix_database_schema import fix_email_directory_table
+                try:
+                    fix_email_directory_table(db.engine)
+                    app.logger.info("Email directory schema fix completed")
+                except Exception as e:
+                    app.logger.warning(f"Email directory schema fix failed (continuing): {str(e)}")
+            else:
+                app.logger.info("Using SQLite - skipping MySQL schema fixes")
+
+            # Check if chatbot database tables are empty
+            from chatbot_models import Faq, Location, Visual, UserRule, GuestRule, EmailDirectory
+            faq_count = Faq.query.count()
+            location_count = Location.query.count()
+            visual_count = Visual.query.count()
+            user_rule_count = UserRule.query.count()
+            guest_rule_count = GuestRule.query.count()
+            email_count = EmailDirectory.query.count()
+
+            # If tables are empty, run migration
+            if faq_count == 0 and location_count == 0 and visual_count == 0 and user_rule_count == 0 and guest_rule_count == 0:
+                app.logger.info("Database tables appear empty, running JSON to database migration...")
+
+                # Import migration functions
+                from migrate_all_json_to_mysql import (
+                    create_sqlalchemy_tables, migrate_categories, migrate_email_directory,
+                    migrate_faqs, migrate_locations, migrate_visuals, migrate_rules
+                )
+
+                try:
+                    # Create tables first
+                    create_sqlalchemy_tables()
+                    app.logger.info("Database tables created successfully for migration")
+
+                    # Determine the correct base path - use volume if mounted, otherwise local
+                    volume_path = '/app/database'
+                    local_db_path = os.path.join(app.root_path, 'database')
+
+                    # Use volume path if it exists and is readable, otherwise use local path
+                    if os.path.exists(volume_path) and os.access(volume_path, os.R_OK):
+                        base_path = volume_path
+                        app.logger.info("Using Railway volume path for migration: /app/database")
+                    else:
+                        base_path = local_db_path
+                        app.logger.info("Using local database path for migration")
+
+                    # Check if JSON files exist before migration
+                    faqs_path = os.path.join(base_path, 'faqs.json')
+                    locations_path = os.path.join(base_path, 'locations', 'locations.json')
+                    visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
+
+                    app.logger.info(f"Checking for JSON files - FAQs: {os.path.exists(faqs_path)}, Locations: {os.path.exists(locations_path)}, Visuals: {os.path.exists(visuals_path)}")
+
+                    # Migrate data
+                    app.logger.info("Starting category migration...")
+                    migrate_categories(base_path)
+
+                    app.logger.info("Starting email directory migration...")
+                    migrate_email_directory(base_path)
+
+                    app.logger.info("Starting FAQs migration...")
+                    migrate_faqs(base_path)
+
+                    app.logger.info("Starting locations migration...")
+                    migrate_locations(base_path)
+
+                    app.logger.info("Starting visuals migration...")
+                    migrate_visuals(base_path)
+
+                    app.logger.info("Starting rules migration...")
+                    migrate_rules(base_path)
+
+                    app.logger.info("JSON to database migration completed successfully!")
+
+                except Exception as e:
+                    app.logger.error(f"Migration failed: {str(e)}")
+                    import traceback
+                    app.logger.error(f"Migration traceback: {traceback.format_exc()}")
+                    db.session.rollback()
+
+            else:
+                app.logger.info("Database tables already contain data, skipping migration")
+
+            # Always populate email directory if empty, regardless of other tables
+            if email_count == 0:
+                app.logger.info("Email directory is empty, populating with sample data...")
+                try:
+                    from populate_email_directory import populate_email_directory
+                    populate_email_directory()
+                    app.logger.info("Email directory populated successfully")
+                except Exception as e:
+                    app.logger.error(f"Failed to populate email directory: {str(e)}")
+
+        except Exception as e:
+            app.logger.error(f"Error during auto-migration check: {str(e)}")
+
+    # Run auto-migration before initializing chatbot (no blocking delays)
+    try:
+        auto_migrate_json_to_db()
+        app.logger.info("Auto-migration completed successfully")
+    except Exception as e:
+        app.logger.error(f"Auto-migration failed: {str(e)}")
+        app.logger.info("Continuing with app startup despite migration failure")
+
+    try:
+        chatbot = Chatbot()  # Rules are now loaded from MySQL automatically
+        app.logger.info("Chatbot initialized successfully")
+    except Exception as e:
+        app.logger.error(f"Failed to initialize chatbot: {str(e)}")
+        chatbot = None
+
+# Initialize database connection for admin operations (may fail, but app can still run)
+try:
+    chatbot_db = ChatbotDB()
+    app.logger.info("Database connection established successfully")
+except Exception as e:
+    app.logger.error(f"Failed to connect to database: {str(e)}")
+    chatbot_db = None
+    # Don't fail app startup if database connection fails
+
+@login_manager.user_loader
+def load_user(user_id):
+    """
+    Load user by ID for Flask-Login.
+    """
+    try:
+        def load_user_operation():
+            user_type = session.get('user_type')
+            if user_type == 'admin':
+                admin = Admin.query.get(int(user_id))
+                if admin:
+                    return admin
+            elif user_type == 'user':
+                user = user_manager.get_user_by_id(user_id)
+                if user:
+                    return user
+            return None
+        return retry_db_operation(load_user_operation)
+    except Exception as e:
+        app.logger.error(f"Database error in load_user: {str(e)}")
+    return None
+
+def is_admin(user):
+    """
+    Helper function to check if a user is an admin.
+    """
+    if user is None:
+        return False
+    if isinstance(user, Admin):
+        return True
+    if hasattr(user, 'role') and user.role == 'admin':
+        return True
+    return False
 
 def retry_db_operation(operation, max_retries=3, delay=1):
     """
@@ -112,215 +482,1726 @@ def retry_db_operation(operation, max_retries=3, delay=1):
             return operation()
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"Database operation failed (attempt {attempt + 1}): {str(e)}")
+                app.logger.warning(f"Database operation failed (attempt {attempt + 1}): {str(e)}")
                 time.sleep(delay * (2 ** attempt))
             else:
-                print(f"Database operation failed after {max_retries} attempts: {str(e)}")
+                app.logger.error(f"Database operation failed after {max_retries} attempts: {str(e)}")
                 raise
 
-def create_sqlalchemy_tables():
-    """Create tables using SQLAlchemy for Railway MySQL"""
-    try:
-        with app.app_context():
-            # Create tables for all binds
-            db.create_all()
-        print("Tables created successfully using SQLAlchemy")
-    except Exception as e:
-        print(f"Error creating tables: {e}")
-        raise
+@app.route('/favicon.ico')
+def favicon():
+    """
+    Suppress favicon requests by returning 204 No Content.
+    """
+    return '', 204
 
-def migrate_categories(base_path):
-    """Migrate categories.json to database"""
-    def migrate_categories_operation():
-        categories_path = os.path.join(base_path, 'categories.json')
+@app.route('/welcome')
+def welcome_api():
+    """
+    Returns a welcome message via API.
+    """
+    app.logger.info(f"Request received: {request.method} {request.path}")
+    return jsonify({'message': 'Welcome to the Flask API Service!'})
+
+@app.route('/')
+def welcome():
+    """
+    Render the welcome page.
+    """
+    return render_template('index.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """
+    Handle user login for regular users and guests.
+    """
+    user_type = request.args.get('user_type', 'user')
+    if request.method == 'POST':
+        if user_type == 'guest':
+            username = request.form.get('username')
+            if not username:
+                flash('Please enter a username', 'danger')
+                return render_template('login.html', user_type=user_type)
+            session['guest_username'] = username
+            session['user_type'] = 'guest'
+            session['logged_in'] = True
+            try:
+                # Log guest login
+                login_log = LoginLog(user_type='guest', identifier=username)
+                db.session.add(login_log)
+                db.session.commit()
+                app.logger.info(f"Guest login logged: {username}")
+            except Exception as e:
+                app.logger.error(f"Failed to log guest login: {str(e)}")
+                db.session.rollback()
+            flash('Guest login successful!', 'success')
+            return redirect(url_for('chat'))
+        else:
+            username_or_email = request.form.get('username') or request.form.get('email')
+            password = request.form.get('password')
+
+            if not username_or_email or not password:
+                flash('Please enter both username/email and password', 'danger')
+                return render_template('login.html', user_type=user_type)
+
+            user = UserModel.query.filter(
+                (UserModel.username == username_or_email) |
+                (UserModel.email == username_or_email)
+            ).first()
+
+            if user and user.check_password(password.strip()):
+                if not user.is_confirmed:
+                    flash('Your account is pending admin confirmation. Please wait for approval.', 'warning')
+                    return redirect(url_for('login', user_type='user'))
+                login_user(user, remember=True)
+                session['user_id'] = user.id
+                session['user_type'] = 'user'
+                session['logged_in'] = True
+                try:
+                    # Log user login
+                    login_log = LoginLog(user_type='user', identifier=user.email)
+                    db.session.add(login_log)
+                    db.session.commit()
+                    app.logger.info(f"User login logged: {user.email}")
+                except Exception as e:
+                    app.logger.error(f"Failed to log user login: {str(e)}")
+                    db.session.rollback()
+                flash('Login successful!', 'success')
+                return redirect(url_for('chat'))
+
+            flash('Invalid username or password')
+    return render_template('login.html', user_type=user_type)
+
+@app.route('/admin_login', methods=['GET', 'POST'])
+def admin_login():
+    """
+    Handle admin login.
+    """
+    from models import Admin as AdminModel
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+
+        if not email or not password:
+            flash('Please enter both email and password', 'danger')
+            return render_template('admin_login.html')
+
+        try:
+            def get_admin():
+                return AdminModel.query.filter_by(email=email).first()
+
+            admin = retry_db_operation(get_admin)
+
+            if admin and admin.check_password(password.strip()):
+                login_user(admin, remember=True)
+                session['user_id'] = admin.id
+                session['user_type'] = 'admin'
+                session['logged_in'] = True
+                flash('Login successful!', 'success')
+                return redirect(url_for('admin_dashboard'))
+
+            flash('Invalid username or password')
+        except Exception as e:
+            app.logger.error(f"Database error during admin login: {str(e)}")
+            flash('Database connection error. Please try again later.', 'danger')
+    return render_template('admin_login.html')
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    """
+    Handle user signup with validation.
+    """
+    if request.method == 'POST':
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+
+        if not email or not re.match(r'^[^@]+@wvsu\.edu\.ph$', email):
+            flash('Email must be a wvsu.edu.ph email address', 'danger')
+            return render_template('signup.html')
+
+        if password != confirm_password:
+            flash('Passwords do not match', 'danger')
+            return render_template('signup.html')
+
+        existing_user_email = user_manager.get_user_by_email(email)
+        if existing_user_email:
+            flash('Email already registered. Please log in.', 'warning')
+            return redirect(url_for('login', user_type='user'))
+
+        existing_user_username = user_manager.get_user_by_username(username)
+        if existing_user_username:
+            flash('Username already taken. Please choose another.', 'danger')
+            return render_template('signup.html')
+
+        # Create user with is_confirmed=False
+        user = user_manager.create_user(username, email, password, 'user')
+        # Set is_confirmed to False explicitly (in case create_user does not set it)
+        user.is_confirmed = False
+        user_manager.db.session.commit()
+
+        flash('Account created! Please wait for admin confirmation before logging in.', 'info')
+        return redirect(url_for('login', user_type='user'))
+
+    return render_template('signup.html')
+
+@app.route('/logout')
+def logout():
+    """
+    Log out the current user or guest.
+    """
+    if current_user.is_authenticated:
+        logout_user()
+    if 'guest_username' in session:
+        session.pop('guest_username', None)
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('welcome'))
+
+@app.route('/chat')
+def chat():
+    """
+    Render the chat page with user info and chat history.
+    """
+    from database import email_directory
+
+    username = None
+    role = session.get('user_type', 'guest')
+
+    # Debug logging for role and authentication
+    # app.logger.debug(f"User role in session: {role}")
+    # app.logger.debug(f"Current user authenticated: {current_user.is_authenticated}")
+
+    if current_user.is_authenticated:
+        if role == 'admin':
+            username = current_user.email
+        elif role == 'user':
+            username = current_user.username
+        else:
+            # Handle other user types safely
+            if hasattr(current_user, 'username'):
+                username = current_user.username
+            elif hasattr(current_user, 'email'):
+                username = current_user.email
+            else:
+                username = str(current_user.id)  # Fallback to user ID
+    elif 'guest_username' in session:
+        username = session['guest_username']
+    else:
+        return redirect(url_for('welcome'))
+
+    session_date = request.args.get('session_date')
+    chat_history = None
+    chat_sessions_summary = None
+
+    if current_user.is_authenticated and role == 'user':
+        chat_sessions_summary = user_manager.get_chat_sessions_summary(current_user.id)
+        if session_date:
+            try:
+                selected_date = datetime.strptime(session_date, "%Y-%m-%d").date()
+            except ValueError:
+                selected_date = None
+
+            if selected_date:
+                full_history = user_manager.get_chat_history(current_user.id)
+                if selected_date in full_history:
+                    chat_history = full_history[selected_date]
+        else:
+            chat_history = None
+
+    emails = email_directory.get_all_emails()
+
+    return render_template(
+        'chat.html', username=username, role=role,
+        chat_history=chat_history, chat_sessions_summary=chat_sessions_summary,
+        emails=emails
+    )
+
+@app.route('/send_message', methods=['POST'])
+def send_message():
+    """
+    Handle sending a message from the user and return chatbot response.
+    """
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        session_id = data.get('session_id', '')
+        user_role = session.get('user_type', None)
+        bot_response = chatbot.get_response(user_message, user_role=user_role)
+
+        if current_user.is_authenticated and isinstance(current_user, UserModel) and session_id:
+            user_manager.add_chat_message(current_user.id, session_id, 'user', user_message)
+            user_manager.add_chat_message(current_user.id, session_id, 'bot', bot_response)
+        elif 'guest_username' in session and session_id:
+            # Store guest messages directly in database
+            from models import ChatMessage
+            guest_username = session['guest_username']
+            guest_user_message = ChatMessage(
+                user_id=None,
+                guest_username=guest_username,
+                session_id=session_id,
+                sender_type='user',
+                message=user_message
+            )
+            guest_bot_message = ChatMessage(
+                user_id=None,
+                guest_username=guest_username,
+                session_id=session_id,
+                sender_type='bot',
+                message=bot_response
+            )
+            db.session.add(guest_user_message)
+            db.session.add(guest_bot_message)
+            db.session.commit()
+
+        return jsonify({
+            'response': bot_response,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        })
+    except Exception as e:
+        app.logger.error(f"Error in send_message: {e}")
+        return jsonify({
+            'response': "I'm sorry, I encountered an error. Please try again.",
+            'timestamp': datetime.utcnow().strftime("%Y-%m-%d %I:%M %p")
+        }), 500
+
+@app.route('/clear_history', methods=['POST'])
+@login_required
+def clear_history():
+    """
+    Clear chat history for the current user.
+    """
+    user_manager.clear_chat_history(current_user.id)
+    return jsonify({'status': 'success'})
+
+@app.route('/get_chat_history')
+@login_required
+def get_chat_history():
+    """
+    Get chat history for the current user.
+    """
+    history = user_manager.get_chat_history(current_user.id)
+    return jsonify(history)
+
+@app.route('/get_chat_sessions_summary')
+@login_required
+def get_chat_sessions_summary():
+    """
+    Get chat sessions summary for sidebar display.
+    """
+    sessions = user_manager.get_chat_sessions_summary(current_user.id)
+    return jsonify(sessions)
+
+@app.route('/get_chat_session_history/<session_id>')
+@login_required
+def get_chat_session_history(session_id):
+    """
+    Get full chat history for a specific session.
+    """
+    history = user_manager.get_chat_session_history(current_user.id, session_id)
+    return jsonify(history)
+
+@app.route('/delete_chat_session/<session_id>', methods=['DELETE'])
+@login_required
+def delete_chat_session(session_id):
+    """
+    Delete a chat session and all its messages.
+    """
+    success = user_manager.delete_chat_session(current_user.id, session_id)
+    if success:
+        return jsonify({'status': 'success'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Session not found or could not be deleted'}), 404
+
+@app.route('/admin')
+@login_required
+def admin_dashboard():
+    """
+    Render the admin dashboard landing page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    # Get pending counts for badges
+    pending_accounts = len(user_manager.get_pending_users())
+    from models import Feedback
+    pending_feedbacks = Feedback.query.count()
+
+    return render_template('admin_dashboard.html', pending_accounts=pending_accounts, pending_feedbacks=pending_feedbacks)
+
+@app.route('/admin/rules')
+@login_required
+def admin_rules():
+    """
+    Render the admin rules page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    rules = chatbot.rules
+    guest_rules = chatbot.guest_rules
+
+    # Add category to each rule if missing (default to 'soict' for user rules)
+    def add_category(rules_list, default_category='soict'):
+        new_list = []
+        for rule in rules_list:
+            if 'category' not in rule:
+                rule['category'] = default_category
+            new_list.append(rule)
+        return new_list
+
+    rules = add_category(rules, default_category='soict')
+    guest_rules = add_category(guest_rules, default_category='guest')
+
+    # Group rules by category for categorized display
+    categorized_user_rules = {}
+    categorized_guest_rules = {}
+
+    for rule in rules:
+        category = rule.get('category', 'soict')
+        if category not in categorized_user_rules:
+            categorized_user_rules[category] = []
+        categorized_user_rules[category].append(rule)
+
+    for rule in guest_rules:
+        category = rule.get('category', 'guest')
+        if category not in categorized_guest_rules:
+            categorized_guest_rules[category] = []
+        categorized_guest_rules[category].append(rule)
+
+    return render_template('admin_rules.html',
+                         rules=rules,
+                         guest_rules=guest_rules,
+                         categorized_user_rules=categorized_user_rules,
+                         categorized_guest_rules=categorized_guest_rules)
+
+@app.route('/admin/accounts')
+@login_required
+def admin_accounts():
+    """
+    Render the admin accounts page for managing user confirmations.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    pending_users = user_manager.get_pending_users()
+    return render_template('admin_accounts.html', pending_users=pending_users)
+
+@app.route('/admin/accounts/approve/<int:user_id>', methods=['POST'])
+@login_required
+def approve_user(user_id):
+    """
+    Approve a user's account.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    success = user_manager.confirm_user(user_id)
+    if success:
+        return jsonify({'status': 'success', 'message': 'User approved successfully'})
+    else:
+        return jsonify({'status': 'error', 'message': 'User not found'})
+
+@app.route('/admin/accounts/reject/<int:user_id>', methods=['POST'])
+@login_required
+def reject_user(user_id):
+    """
+    Reject a user's account (delete the user).
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    success = user_manager.reject_user(user_id)
+    if success:
+        return jsonify({'status': 'success', 'message': 'User rejected successfully'})
+    else:
+        return jsonify({'status': 'error', 'message': 'User not found'})
+
+@app.route('/admin/faqs')
+@login_required
+def admin_faqs():
+    """
+    Render the admin FAQs management page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    from chatbot_models import Faq
+    try:
+        # Use SQLAlchemy bind_key='chatbot_db' via db.session
+        faqs_list = db.session.query(Faq).order_by(Faq.created_at.desc()).all()
+        faqs_data = [{"id": faq.id, "question": faq.question, "answer": faq.answer} for faq in faqs_list]
+    except Exception as e:
+        faqs_data = []
+        app.logger.error(f"Failed to load FAQs from MySQL: {e}")
+
+    # Prevent caching to ensure fresh data on reload
+    response = make_response(render_template('admin_faqs.html', info_list=faqs_data))
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+@app.route('/add_info', methods=['POST'])
+@login_required
+def add_info():
+    """
+    Add a new FAQ entry to MySQL Faq table.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    question = data.get('question', '').strip()
+    answer = data.get('answer', '').strip()
+
+    if not question or not answer:
+        return jsonify({'status': 'error', 'message': 'Question and answer are required'})
+
+    from chatbot_models import Faq
+    try:
+        # Use SQLAlchemy bind_key='chatbot_db' via db.session
+        new_faq = Faq(question=question, answer=answer)
+        db.session.add(new_faq)
+        db.session.commit()
+        # Reload FAQs in chatbot memory
+        chatbot.reload_faqs()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to save FAQ: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/edit_info', methods=['POST'])
+@login_required
+def edit_info():
+    """
+    Edit an existing FAQ entry in MySQL Faq table.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    info_id = data.get('info_id')
+    question = data.get('question', '').strip()
+    answer = data.get('answer', '').strip()
+
+    app.logger.info(f"Editing FAQ with ID: {info_id}, question: {question[:50]}..., answer: {answer[:50]}...")
+
+    if info_id is None or not question or not answer:
+        return jsonify({'status': 'error', 'message': 'ID, question, and answer are required'})
+
+    from chatbot_models import Faq
+    try:
+        # Use SQLAlchemy bind_key='chatbot_db' via db.session
+        faq = db.session.query(Faq).get(info_id)
+        if not faq:
+            return jsonify({'status': 'error', 'message': 'FAQ not found'})
+
+        faq.question = question
+        faq.answer = answer
+        db.session.commit()
+        # Reload FAQs in chatbot memory
+        chatbot.reload_faqs()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to update FAQ: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/delete_info', methods=['POST'])
+@login_required
+def delete_info():
+    """
+    Delete an FAQ entry from MySQL Faq table.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    info_id = data.get('info_id')
+
+    if info_id is None:
+        return jsonify({'status': 'error', 'message': 'ID is required'})
+
+    from chatbot_models import Faq
+    try:
+        faq = Faq.query.get(info_id)
+        if not faq:
+            return jsonify({'status': 'error', 'message': 'FAQ not found'})
+
+        db.session.delete(faq)
+        db.session.commit()
+        # Reload FAQs in chatbot memory
+        chatbot.reload_faqs()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to delete FAQ: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/admin/locations')
+@login_required
+def admin_locations():
+    """
+    Render the admin locations page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    return render_template('admin_locations.html')
+
+@app.route('/admin/add_locations')
+@login_required
+def admin_add_locations():
+    """
+    Render the admin add locations page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    return render_template('admin_add_locations.html')
+
+@app.route('/admin/existing_locations')
+@login_required
+def admin_existing_locations():
+    """
+    Render the admin existing locations page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    try:
+        # Use SQLAlchemy bind_key='chatbot_db' via db.session
+        from chatbot_models import Location
+        locations_list = db.session.query(Location).order_by(Location.created_at.desc()).all()
+
+        # Convert to list format expected by template
+        locations = []
+        for loc in locations_list:
+            # Flatten questions if it's a list of lists
+            questions = loc.questions if loc.questions else []
+            if isinstance(questions, list) and len(questions) > 0 and isinstance(questions[0], list):
+                flattened_questions = []
+                for q_list in questions:
+                    if isinstance(q_list, list):
+                        flattened_questions.extend(q_list)
+                    else:
+                        flattened_questions.append(str(q_list))
+                questions = flattened_questions
+
+            location_dict = {
+                'id': str(loc.id),
+                'description': str(loc.description or ''),
+                'user_type': str(loc.user_type or 'both'),
+                'urls': loc.urls if isinstance(loc.urls, list) else [],
+                'url': str(loc.url or ''),
+                'questions': questions,
+                'created_at': loc.created_at.strftime('%Y-%m-%d %H:%M:%S') if loc.created_at else ''
+            }
+            locations.append(location_dict)
+    except Exception as e:
+        locations = []
+        app.logger.error(f"Failed to load locations from database: {e}")
+
+    return render_template('admin_existing_locations.html', locations=locations)
+
+@app.route('/admin/visuals')
+@login_required
+def admin_visuals():
+    """
+    Render the admin visuals page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    return render_template('admin_visuals.html')
+
+@app.route('/admin/add_visuals')
+@login_required
+def admin_add_visuals():
+    """
+    Render the admin add visuals page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    return render_template('admin_add_visuals.html')
+
+@app.route('/admin/existing_visuals')
+@login_required
+def admin_existing_visuals():
+    """
+    Render the admin existing visuals page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    try:
+        # Use SQLAlchemy bind_key='chatbot_db' via db.session
+        from chatbot_models import Visual
+        visuals_list = db.session.query(Visual).order_by(Visual.created_at.desc()).all()
+
+        # Convert to list format expected by template
+        visuals = []
+        for vis in visuals_list:
+            # Flatten questions if it's a list of lists
+            questions = vis.questions if vis.questions else []
+            if isinstance(questions, list) and len(questions) > 0 and isinstance(questions[0], list):
+                flattened_questions = []
+                for q_list in questions:
+                    if isinstance(q_list, list):
+                        flattened_questions.extend(q_list)
+                    else:
+                        flattened_questions.append(str(q_list))
+                questions = flattened_questions
+
+            visual_dict = {
+                'id': str(vis.id),
+                'description': str(vis.description or ''),
+                'user_type': str(vis.user_type or 'both'),
+                'urls': vis.urls if isinstance(vis.urls, list) else [],
+                'url': str(vis.url or ''),
+                'questions': questions,
+                'created_at': vis.created_at.strftime('%Y-%m-%d %H:%M:%S') if vis.created_at else ''
+            }
+            visuals.append(visual_dict)
+    except Exception as e:
+        visuals = []
+        app.logger.error(f"Failed to load visuals from database: {e}")
+
+    return render_template('admin_existing_visuals.html', visuals=visuals)
+
+@app.route('/add_location', methods=['POST'])
+@login_required
+def add_location():
+    """
+    Add a new location with images to MySQL Location table.
+    """
+    import json
+    import os
+    import uuid
+
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    questions = request.form.get('questions', '').strip()
+    description = request.form.get('description', '').strip()
+    user_type = request.form.get('user_type', 'both')
+
+    if not questions or not description:
+        return jsonify({'status': 'error', 'message': 'Questions and description are required'})
+
+    # Process questions as JSON array of strings, each string is a separate set
+    questions_data = json.loads(questions) if questions else []
+    questions_list = []
+    for set_str in questions_data:
+        if isinstance(set_str, str):
+            set_list = [set_str.strip()] if set_str.strip() else []
+        elif isinstance(set_str, list):
+            set_list = [k.strip() for k in set_str if k.strip()]
+        else:
+            set_list = []
+        questions_list.append(set_list)
+
+    # Handle file uploads
+    uploaded_files = request.files.getlist('images')
+    image_urls = []
+
+    for file in uploaded_files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            file.save(filepath)
+            image_urls.append(f"uploads/locations/{unique_filename}")
+
+    if not image_urls:
+        return jsonify({'status': 'error', 'message': 'At least one image is required'})
+
+    # Save to MySQL Location table
+    from chatbot_models import Location
+    try:
+        new_location = Location(
+            id=str(uuid.uuid4()),
+            questions=questions_list,
+            description=description,
+            user_type=user_type,
+            urls=image_urls,
+            url=image_urls[0]  # Primary image
+        )
+        db.session.add(new_location)
+        db.session.commit()
+        # Reload location rules in chatbot memory
+        chatbot.reload_location_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to save location: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/edit_location/<location_id>', methods=['POST'])
+@login_required
+def edit_location_with_id(location_id):
+    """
+    Edit an existing location with images in MySQL Location table.
+    """
+    import json
+    import os
+    import uuid
+
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    questions = request.form.get('questions', '').strip()
+    description = request.form.get('description', '').strip()
+    user_type = request.form.get('user_type', 'both')
+    removed_images = json.loads(request.form.get('removedImages', '[]'))
+
+    if not questions or not description:
+        return jsonify({'status': 'error', 'message': 'Questions and description are required'})
+
+    # Process questions as JSON array of strings, each string is a separate set
+    questions_data = json.loads(questions) if questions else []
+    questions_list = []
+    for set_str in questions_data:
+        if isinstance(set_str, str):
+            set_list = [set_str.strip()] if set_str.strip() else []
+        elif isinstance(set_str, list):
+            set_list = [k.strip() for k in set_str if k.strip()]
+        else:
+            set_list = []
+        questions_list.append(set_list)
+
+    # Find location to edit in MySQL
+    from chatbot_models import Location
+    location_to_edit = Location.query.filter_by(id=location_id).first()
+    if not location_to_edit:
+        return jsonify({'status': 'error', 'message': 'Location not found'})
+
+    # Update location data
+    location_to_edit.questions = questions_list
+    location_to_edit.description = description
+    location_to_edit.user_type = user_type
+
+    # Handle image removal
+    if location_to_edit.urls:
+        location_to_edit.urls = [url for url in location_to_edit.urls if url not in removed_images]
+
+    if location_to_edit.url in removed_images:
+        location_to_edit.url = None
+
+    # Handle new image uploads
+    uploaded_files = request.files.getlist('images')
+    new_image_urls = []
+
+    for file in uploaded_files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            file.save(filepath)
+            new_image_urls.append(f"uploads/locations/{unique_filename}")
+
+    # Add new images to existing ones
+    if not location_to_edit.urls:
+        location_to_edit.urls = []
+
+    location_to_edit.urls.extend(new_image_urls)
+
+    # Ensure primary url exists
+    if not location_to_edit.url and location_to_edit.urls:
+        location_to_edit.url = location_to_edit.urls[0]
+
+    # Save to MySQL
+    try:
+        db.session.commit()
+        # Reload location rules in chatbot memory
+        chatbot.reload_location_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to save location: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/delete_location', methods=['POST'])
+@login_required
+def delete_location():
+    """
+    Delete a location entry from MySQL Location table.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    location_id = data.get('id')
+
+    if not location_id:
+        return jsonify({'status': 'error', 'message': 'ID is required'})
+
+    from chatbot_models import Location
+    try:
+        location = Location.query.filter_by(id=location_id).first()
+        if not location:
+            return jsonify({'status': 'error', 'message': 'Location not found'})
+
+        db.session.delete(location)
+        db.session.commit()
+        # Reload location rules in chatbot memory
+        chatbot.reload_location_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to delete location: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/add_visual', methods=['POST'])
+@login_required
+def add_visual():
+    """
+    Add a new visual with images/videos to MySQL Visual table.
+    """
+    import json
+    import os
+    import uuid
+
+    app.logger.info(f"Request received: {request.method} {request.path}")
+
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    questions = request.form.get('questions', '').strip()
+    description = request.form.get('description', '').strip()
+    user_type = request.form.get('user_type', 'both')
+
+    if not description:
+        return jsonify({'status': 'error', 'message': 'Description is required'})
+
+    # Process questions as JSON array of strings, each string is a separate set
+    questions_data = json.loads(questions) if questions else []
+    questions_list = []
+    for set_str in questions_data:
+        if isinstance(set_str, str):
+            set_list = [set_str.strip()] if set_str.strip() else []
+        elif isinstance(set_str, list):
+            set_list = [k.strip() for k in set_str if k.strip()]
+        else:
+            set_list = []
+        questions_list.append(set_list)
+
+    # Handle file uploads
+    uploaded_files = request.files.getlist('images')
+    media_urls = []
+
+    for file in uploaded_files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            filename = re.sub(r'\.+', '.', filename)  # Replace multiple dots with single dot
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            filepath = os.path.join(app.config['VISUALS_UPLOAD_FOLDER'], unique_filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            file.save(filepath)
+            media_urls.append(f"uploads/visuals/{unique_filename}")
+
+    if not media_urls:
+        return jsonify({'status': 'error', 'message': 'At least one image or video is required'})
+
+    # Save to MySQL Visual table
+    from chatbot_models import Visual
+    try:
+        new_visual = Visual(
+            id=str(uuid.uuid4()),
+            questions=questions_list,
+            description=description,
+            user_type=user_type,
+            urls=media_urls,
+            url=media_urls[0]  # Primary media
+        )
+        db.session.add(new_visual)
+        db.session.commit()
+        # Update visuals in memory
+        chatbot.reload_visual_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to save visual: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/edit_visual/<visual_id>', methods=['POST'])
+@login_required
+def edit_visual_with_id(visual_id):
+    """
+    Edit an existing visual with images/videos in MySQL Visual table.
+    """
+    import json
+    import os
+    import uuid
+
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    questions = request.form.get('questions', '').strip()
+    description = request.form.get('description', '').strip()
+    user_type = request.form.get('user_type', 'both')
+    removed_images = json.loads(request.form.get('removedImages', '[]'))
+
+    if not questions or not description:
+        return jsonify({'status': 'error', 'message': 'Questions and description are required'})
+
+    # Process questions as JSON array of strings, each string is a separate set
+    questions_data = json.loads(questions) if questions else []
+    questions_list = []
+    for set_str in questions_data:
+        if isinstance(set_str, str):
+            set_list = [set_str.strip()] if set_str.strip() else []
+        elif isinstance(set_str, list):
+            set_list = [k.strip() for k in set_str if k.strip()]
+        else:
+            set_list = []
+        questions_list.append(set_list)
+
+    # Find visual to edit in MySQL
+    from chatbot_models import Visual
+    visual_to_edit = Visual.query.filter_by(id=visual_id).first()
+    if not visual_to_edit:
+        return jsonify({'status': 'error', 'message': 'Visual not found'})
+
+    # Update visual data
+    visual_to_edit.questions = questions_list
+    visual_to_edit.description = description
+    visual_to_edit.user_type = user_type
+
+    # Handle image removal
+    if visual_to_edit.urls:
+        visual_to_edit.urls = [url for url in visual_to_edit.urls if url not in removed_images]
+
+    if visual_to_edit.url in removed_images:
+        visual_to_edit.url = None
+
+    # Handle new media uploads
+    uploaded_files = request.files.getlist('images')
+    new_media_urls = []
+
+    for file in uploaded_files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            filepath = os.path.join(app.config['VISUALS_UPLOAD_FOLDER'], unique_filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            file.save(filepath)
+            new_media_urls.append(f"uploads/visuals/{unique_filename}")
+
+    # Add new media to existing ones
+    if not visual_to_edit.urls:
+        visual_to_edit.urls = []
+
+    visual_to_edit.urls.extend(new_media_urls)
+
+    # Ensure primary url exists
+    if not visual_to_edit.url and visual_to_edit.urls:
+        visual_to_edit.url = visual_to_edit.urls[0]
+
+    # Save to MySQL
+    try:
+        db.session.commit()
+        # Update visuals in memory
+        chatbot.reload_visual_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to save visual: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/delete_visual', methods=['POST'])
+@login_required
+def delete_visual():
+    """
+    Delete a visual entry from MySQL Visual table.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    visual_id = data.get('id')
+
+    if not visual_id:
+        return jsonify({'status': 'error', 'message': 'ID is required'})
+
+    from chatbot_models import Visual
+    try:
+        visual = Visual.query.filter_by(id=visual_id).first()
+        if not visual:
+            return jsonify({'status': 'error', 'message': 'Visual not found'})
+
+        db.session.delete(visual)
+        db.session.commit()
+        # Reload visual rules in chatbot memory
+        chatbot.reload_visual_rules()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Failed to delete visual: {str(e)}'})
+
+    return jsonify({'status': 'success'})
+
+@app.route('/admin/emails')
+@login_required
+def admin_emails():
+    """
+    Render the admin emails page.
+    """
+    from database import email_directory
+
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    emails = email_directory.get_all_emails()
+
+    return render_template('admin_emails.html', emails=emails)
+
+@app.route('/add_category', methods=['POST'])
+@login_required
+def add_category():
+    """
+    Add a new category to the system.
+    """
+    print(f"DEBUG: add_category called. Session: {session}")
+    print(f"DEBUG: Current user: {current_user}, is_authenticated: {current_user.is_authenticated}")
+
+    if not is_admin(current_user):
+        print("DEBUG: Unauthorized access - user is not admin")
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    print(f"DEBUG: Request data: {data}")
+
+    category_name = data.get('category_name', '').strip()
+    print(f"DEBUG: Category name: '{category_name}'")
+
+    if not category_name:
+        print("DEBUG: Category name is required")
+        return jsonify({'status': 'error', 'message': 'Category name is required'})
+
+    # Logic to store the category in a JSON file
+    app.logger.info(f"Attempting to add category: {category_name} by user: {current_user.email}")
+    app.logger.info(f"Request data: {data}")  # Log the request data for debugging
+    # For now, let's assume we are storing it in a JSON file
+    categories_path = os.path.join(app.root_path, 'database', 'categories.json')
+    print(f"DEBUG: Categories path: {categories_path}")
+
+    try:
+        if os.path.exists(categories_path):
+            print("DEBUG: categories.json exists")
+            with open(categories_path, 'r', encoding='utf-8') as f:
+                categories = json.load(f)
+        else:
+            print("DEBUG: categories.json does not exist, creating empty list")
+            categories = []
+
+        # Check for duplicates (case-insensitive)
+        if category_name.lower() in [cat.lower() for cat in categories]:
+            print(f"DEBUG: Category '{category_name}' already exists")
+            return jsonify({'status': 'error', 'message': 'Category already exists'})
+
+        categories.append(category_name)  # Add the new category to the list
+        # Note: Category files are created automatically when rules are added to new categories
+        # No need to create empty category files upfront
+        print(f"DEBUG: Adding category '{category_name}' to list: {categories}")
+
+        with open(categories_path, 'w', encoding='utf-8') as f:
+            json.dump(categories, f, indent=4)
+        print("DEBUG: Successfully wrote to categories.json")
+
+        # Add empty category to combined rule files
+        from database.user_database import rule_utils
+        rule_utils.add_empty_category(category_name, user_type='both')
+
+        # Add the new category to rule_utils CATEGORY_FILES dynamically
+        category_lower = category_name.lower()
+        if category_lower not in rule_utils.CATEGORY_FILES:
+            # Point to combined files instead of creating new ones
+            rule_utils.CATEGORY_FILES[category_lower] = {
+                "user": os.path.join(app.root_path, 'database', 'user_database', 'all_user_rules.json'),
+                "guest": os.path.join(app.root_path, 'database', 'guest_database', 'all_guest_rules.json')
+            }
+            app.logger.info(f"Added {category_lower} to rule_utils.CATEGORY_FILES pointing to combined files")
+
+        return jsonify({'status': 'success', 'message': 'Category added successfully', 'redirect': url_for('admin_dashboard')})
+    except Exception as e:
+        app.logger.error(f"Error adding category: {str(e)}")  # Log the error with details
+        app.logger.error(f"Request data: {data}")  # Log the request data for debugging
+        print(f"DEBUG: Exception occurred: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to add category: {str(e)}. Please check the server logs for more details.'})
+
+@app.route('/remove_category', methods=['POST'])
+@login_required
+def remove_category():
+    """
+    Remove a category from the system, including deleting associated rule files and updating all_*_rules.json files.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    category_name = data.get('category_name', '').strip()
+
+    if not category_name:
+        return jsonify({'status': 'error', 'message': 'Category name is required'})
+
+    categories_path = os.path.join(app.root_path, 'database', 'categories.json')
+
+    try:
         if os.path.exists(categories_path):
             with open(categories_path, 'r', encoding='utf-8') as f:
                 categories = json.load(f)
+        else:
+            categories = []
 
-            for category in categories:
-                # Check if category already exists
-                existing = Category.query.filter_by(name=category).first()
-                if not existing:
-                    new_cat = Category(name=category)
-                    db.session.add(new_cat)
-            db.session.commit()
-            print(f"Migrated {len(categories)} categories")
+        # Remove category if it exists (case-insensitive)
+        categories_lower = [cat.lower() for cat in categories]
+        if category_name.lower() not in categories_lower:
+            return jsonify({'status': 'error', 'message': 'Category not found'})
 
-    with app.app_context():
-        retry_db_operation(migrate_categories_operation)
+        # Remove the category (case-insensitive)
+        index_to_remove = categories_lower.index(category_name.lower())
+        removed_category = categories.pop(index_to_remove)
 
-def migrate_email_directory(base_path):
-    """Migrate email_directory.py to database"""
-    email_dir_path = os.path.join(base_path, 'email_directory.py')
-    if os.path.exists(email_dir_path):
-        # Read the Python file and extract the data
-        with open(email_dir_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # Save updated categories
+        with open(categories_path, 'w', encoding='utf-8') as f:
+            json.dump(categories, f, indent=4)
 
-        # Extract the emails list from the Python file
-        tree = ast.parse(content)
-        emails_data = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'emails':
-                    if isinstance(node.value, ast.List):
-                        for item in node.value.elts:
-                            if isinstance(item, ast.Dict):
-                                email_dict = {}
-                                for key, value in zip(item.keys, item.values):
-                                    if isinstance(key, ast.Str) and isinstance(value, ast.Str):
-                                        email_dict[key.s] = value.s
-                                emails_data.append(email_dict)
+        # Remove category from all_user_rules.json and all_guest_rules.json
+        from database.user_database import rule_utils
+        rule_utils.remove_category(removed_category, user_type='both')
 
-        with app.app_context():
-            for email_data in emails_data:
-                # Check if email already exists
-                existing = EmailDirectory.query.filter_by(school=email_data.get('school', ''), email=email_data.get('email', '')).first()
-                if not existing:
-                    new_email = EmailDirectory(school=email_data.get('school', ''), email=email_data.get('email', ''))
-                    db.session.add(new_email)
-            db.session.commit()
-        print(f"Migrated {len(emails_data)} email entries")
+        # Delete associated rule files
+        user_rule_file = os.path.join(app.root_path, 'database', 'user_database', f"{removed_category.lower()}_rules.json")
+        guest_rule_file = os.path.join(app.root_path, 'database', 'guest_database', f"{removed_category.lower()}_guest_rules.json")
 
-def migrate_faqs(base_path):
-    """Migrate faqs.json to database, avoiding duplicates"""
-    def migrate_faqs_operation():
-        faqs_path = os.path.join(base_path, 'faqs.json')
-        if os.path.exists(faqs_path):
-            with open(faqs_path, 'r', encoding='utf-8') as f:
-                faqs = json.load(f)
+        if os.path.exists(user_rule_file):
+            os.remove(user_rule_file)
+        if os.path.exists(guest_rule_file):
+            os.remove(guest_rule_file)
 
-            migrated_count = 0
-            for faq in faqs:
-                # Check if FAQ already exists
-                existing = Faq.query.filter_by(question=faq.get('question', ''), answer=faq.get('answer', '')).first()
-                if not existing:
-                    new_faq = Faq(question=faq.get('question', ''), answer=faq.get('answer', ''))
-                    db.session.add(new_faq)
-                    migrated_count += 1
-            db.session.commit()
-            print(f"Migrated {migrated_count} new FAQs (skipped {len(faqs) - migrated_count} duplicates)")
+        # Update chatbot rules in memory
+        chatbot.rules = chatbot.get_rules()
+        chatbot.guest_rules = chatbot.get_guest_rules()
 
-    with app.app_context():
-        retry_db_operation(migrate_faqs_operation)
+        return jsonify({'status': 'success', 'message': f'Category {removed_category} removed successfully', 'redirect': url_for('admin_dashboard')})
+    except Exception as e:
+        app.logger.error(f"Error removing category: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to remove category: {str(e)}'})
 
-def migrate_locations(base_path):
-    """Migrate locations.json to database"""
-    locations_path = os.path.join(base_path, 'locations', 'locations.json')
-    if os.path.exists(locations_path):
-        with open(locations_path, 'r', encoding='utf-8') as f:
-            locations = json.load(f)
+@app.route('/get_categories', methods=['GET'])
+@login_required
+def get_categories():
+    """
+    Get all categories from categories.json.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
 
-        with app.app_context():
-            for location in locations:
-                new_loc = Location(
-                    id=location.get('id', ''),
-                    questions=location.get('questions', []),
-                    description=location.get('description', ''),
-                    user_type=location.get('user_type', 'both'),
-                    urls=location.get('urls', []),
-                    url=location.get('url', '')
-                )
-                db.session.add(new_loc)
-            db.session.commit()
-        print(f"Migrated {len(locations)} locations")
+    categories_path = os.path.join(app.root_path, 'database', 'categories.json')
+    try:
+        with open(categories_path, 'r', encoding='utf-8') as f:
+            categories = json.load(f)
+        return jsonify({'status': 'success', 'categories': categories})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Failed to load categories: {str(e)}'})
 
-def migrate_visuals(base_path):
-    """Migrate visuals.json to database"""
-    def migrate_visuals_operation():
-        visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
-        if os.path.exists(visuals_path):
-            with open(visuals_path, 'r', encoding='utf-8') as f:
-                visuals = json.load(f)
+@app.route('/create_category', methods=['POST'])
+@login_required
+def create_category():
+    """
+    Create JSON files for a new category in both user and guest databases.
+    """
+    print(f"DEBUG: create_category called. Session: {session}")
+    print(f"DEBUG: Current user: {current_user}, is_authenticated: {current_user.is_authenticated}")
 
-            for visual in visuals:
-                new_vis = Visual(
-                    id=visual.get('id', ''),
-                    questions=visual.get('questions', []),
-                    description=visual.get('description', ''),
-                    user_type=visual.get('user_type', 'both'),
-                    urls=visual.get('urls', []),
-                    url=visual.get('url', '')
-                )
-                db.session.add(new_vis)
-            db.session.commit()
-            print(f"Migrated {len(visuals)} visuals")
+    if not is_admin(current_user):
+        print("DEBUG: Unauthorized access - user is not admin")
+        app.logger.error("Unauthorized access attempt to create category.")
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
 
-    with app.app_context():
-        retry_db_operation(migrate_visuals_operation)
+    data = request.get_json()
+    print(f"DEBUG: Request data: {data}")
 
-def migrate_rules(base_path):
-    """Migrate user and guest rules from JSON files to database"""
-    # Migrate user rules
-    user_db_path = os.path.join(base_path, 'user_database')
-    if os.path.exists(user_db_path):
-        rules_file = os.path.join(user_db_path, 'all_user_rules.json')
-        if os.path.exists(rules_file):
-            with open(rules_file, 'r', encoding='utf-8') as f:
-                user_rules_data = json.load(f)
+    category = data.get('category', '').strip()
+    print(f"DEBUG: Category: '{category}'")
 
-            with app.app_context():
-                total_user_rules = 0
-                for category, rules_list in user_rules_data.items():
-                    for rule in rules_list:
-                        new_rule = UserRule(
-                            category=category.lower(),
-                            question=rule.get('question', ''),
-                            answer=rule.get('answer', ''),
-                            user_type='user'
-                        )
-                        db.session.add(new_rule)
-                        total_user_rules += 1
-                db.session.commit()
-            print(f"Migrated {total_user_rules} user rules")
-
-    # Migrate guest rules
-    guest_db_path = os.path.join(base_path, 'guest_database')
-    if os.path.exists(guest_db_path):
-        rules_file = os.path.join(guest_db_path, 'all_guest_rules.json')
-        if os.path.exists(rules_file):
-            with open(rules_file, 'r', encoding='utf-8') as f:
-                guest_rules_data = json.load(f)
-
-            with app.app_context():
-                total_guest_rules = 0
-                for category, rules_list in guest_rules_data.items():
-                    for rule in rules_list:
-                        new_rule = GuestRule(
-                            category=category.lower(),
-                            question=rule.get('question', ''),
-                            answer=rule.get('answer', ''),
-                            user_type='guest'
-                        )
-                        db.session.add(new_rule)
-                        total_guest_rules += 1
-                db.session.commit()
-            print(f"Migrated {total_guest_rules} guest rules")
-
-def main():
-    """Main migration function using SQLAlchemy"""
-    base_path = 'database'
-
-    print("Starting JSON to Railway MySQL database migration...")
-
-    # Create tables
-    create_sqlalchemy_tables()
+    if not category:
+        print("DEBUG: Category name is required.")
+        app.logger.error("Category name is required.")
+        return jsonify({'status': 'error', 'message': 'Category name is required'})
 
     try:
-        # Migrate data
-        migrate_categories(base_path)
-        migrate_email_directory(base_path)
-        migrate_faqs(base_path)
-        migrate_locations(base_path)
-        migrate_visuals(base_path)
-        migrate_rules(base_path)
-
-        print("Migration completed successfully!")
-
+        # Create category files using the chatbot's method
+        print(f"DEBUG: Calling chatbot.create_category_files('{category}')")
+        chatbot.create_category_files(category)
+        app.logger.info(f"Category files created for: {category}")
+        print(f"DEBUG: Category files created successfully for: {category}")
+        return jsonify({'status': 'success', 'message': f'Category files created for {category}'})
     except Exception as e:
-        print(f"Migration failed: {str(e)}")
-        with app.app_context():
-            db.session.rollback()
+        app.logger.error(f"Error creating category files: {str(e)}")
+        print(f"DEBUG: Exception occurred in create_category_files: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to create category files: {str(e)}'})
+
+@app.route('/admin/feedback')
+@login_required
+def admin_feedback():
+    """
+    Render the admin feedback page.
+    """
+    from models import Feedback
+
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    feedbacks = Feedback.query.order_by(Feedback.timestamp.desc()).all()
+
+    # Format timestamps for display
+    for fb in feedbacks:
+        fb.formatted_timestamp = fb.timestamp.strftime('%B %d, %Y')
+
+    return render_template('admin_feedback.html', feedbacks=feedbacks)
+
+@app.route('/admin/feedback/mark_done', methods=['POST'])
+@login_required
+def mark_feedback_done():
+    """
+    Mark feedback as done: remove from DB, save to feedback.json, send email notification.
+    """
+    from models import Feedback
+
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    feedback_id = data.get('feedback_id')
+
+    if not feedback_id:
+        return jsonify({'status': 'error', 'message': 'Feedback ID is required'})
+
+    feedback = Feedback.query.get(feedback_id)
+    if not feedback:
+        return jsonify({'status': 'error', 'message': 'Feedback not found'})
+
+    # Prepare feedback data to save
+    feedback_data = {
+        'id': feedback.id,
+        'user_id': feedback.user_id,
+        'message': feedback.message,
+        'timestamp': feedback.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+    # Path to feedback.json
+    feedback_json_path = os.path.join(app.root_path, 'database', 'feedback', 'feedback.json')
+
+    # Load existing feedbacks from JSON file
+    try:
+        if os.path.exists(feedback_json_path):
+            with open(feedback_json_path, 'r', encoding='utf-8') as f:
+                existing_feedbacks = json.load(f)
+        else:
+            existing_feedbacks = []
+    except Exception as e:
+        existing_feedbacks = []
+
+    # Append new feedback data
+    existing_feedbacks.append(feedback_data)
+
+    # Save back to JSON file
+    try:
+        with open(feedback_json_path, 'w', encoding='utf-8') as f:
+            json.dump(existing_feedbacks, f, indent=4)
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Failed to save feedback to JSON: {str(e)}'})
+
+    # Remove feedback from DB
+    try:
+        db.session.delete(feedback)
+        db.session.commit()
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Failed to delete feedback from DB: {str(e)}'})
+
+    # Commenting out email notification logic for now
+    # Send email notification
+    # try:
+    #     # Get admin emails from email directory
+    #     from database import email_directory
+    #     admin_emails = [entry['email'] for entry in email_directory.get_all_emails()]
+
+    #     if admin_emails:
+    #         subject = "Feedback Marked as Done"
+    #         body = f"Feedback ID: {feedback_data['id']}\nUser ID: {feedback_data['user_id']}\nMessage: {feedback_data['message']}\nTimestamp: {feedback_data['timestamp']}"
+    #         msg = Message(subject=subject, recipients=admin_emails, body=body)
+
+    return jsonify({'status': 'success'})
+
+@app.route('/admin/feedback/finished', methods=['GET'])
+@login_required
+def get_finished_feedback():
+    """
+    Return finished feedback loaded from feedback.json as JSON, filtering out feedback older than 30 days.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    feedback_json_path = os.path.join(app.root_path, 'database', 'feedback', 'feedback.json')
+
+    try:
+        if os.path.exists(feedback_json_path):
+            with open(feedback_json_path, 'r', encoding='utf-8') as f:
+                finished_feedback = json.load(f)
+        else:
+            finished_feedback = []
+    except Exception as e:
+        app.logger.error(f"Failed to load finished feedback: {str(e)}")
+        finished_feedback = []
+
+    # Filter out feedback older than 30 days
+    current_time = datetime.now()
+    thirty_days_ago = current_time - timedelta(days=30)
+    finished_feedback = [
+        fb for fb in finished_feedback
+        if datetime.strptime(fb['timestamp'], '%Y-%m-%d %H:%M:%S') > thirty_days_ago
+    ]
+
+    # Format timestamps for display
+    for fb in finished_feedback:
+        dt = datetime.strptime(fb['timestamp'], '%Y-%m-%d %H:%M:%S')
+        fb['timestamp'] = dt.strftime('%B %d, %Y')
+
+    # Save the filtered feedback back to the file to remove old entries (keeping original format)
+    try:
+        # Reload and filter again for saving, without formatting
+        if os.path.exists(feedback_json_path):
+            with open(feedback_json_path, 'r', encoding='utf-8') as f:
+                all_feedback = json.load(f)
+        else:
+            all_feedback = []
+        filtered_for_save = [
+            fb for fb in all_feedback
+            if datetime.strptime(fb['timestamp'], '%Y-%m-%d %H:%M:%S') > thirty_days_ago
+        ]
+        with open(feedback_json_path, 'w', encoding='utf-8') as f:
+            json.dump(filtered_for_save, f, indent=4)
+    except Exception as e:
+        app.logger.error(f"Failed to save filtered feedback: {str(e)}")
+
+    return jsonify({'status': 'success', 'finished_feedback': finished_feedback})
+
+@app.route('/add_rule', methods=['POST'])
+@login_required
+def add_rule():
+    """
+    Add a new chatbot rule via admin interface.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    # Handle both form data and JSON data for backward compatibility
+    if request.is_json:
+        data = request.get_json()
+        question = data.get('keywords', '')  # The form sends question as 'keywords' field
+        response = data.get('response', '')
+        user_type = data.get('user_type', 'user')
+        category = data.get('category', 'soict')
+    else:
+        # Handle form data
+        question = request.form.get('keywords', '').strip()
+        response = request.form.get('response', '').strip()
+        user_type = request.form.get('user_type', 'user')
+        category = request.form.get('category', 'soict')
+
+    if not question or not response:
+        return jsonify({'status': 'error', 'message': 'Question and response are required'})
+
+    try:
+        if category == "locations":
+            result = chatbot.add_rule(question, response, category=category)
+        else:
+            result = chatbot.add_rule(question, response, user_type=user_type, category=category)
+
+        if result is None:
+            return jsonify({'status': 'error', 'message': 'Failed to add rule to database'})
+
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        app.logger.error(f"Error adding rule: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'An error occurred while adding the rule'})
+
+@app.route('/delete_rule', methods=['POST'])
+@login_required
+def delete_rule():
+    """
+    Delete a chatbot rule via admin interface.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    rule_id = data.get('rule_id')
+    user_type = data.get('user_type', 'user')
+
+    if not rule_id:
+        return jsonify({'status': 'error', 'message': 'Rule ID is required'})
+
+    # Use chatbot's delete_rule method
+    deleted = chatbot.delete_rule(rule_id, user_type)
+
+    if deleted:
+        return jsonify({'status': 'success', 'message': 'Rule deleted successfully'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Rule not found or could not be deleted'})
+
+@app.route('/edit_rule', methods=['POST'])
+@login_required
+def edit_rule():
+    """
+    Edit a chatbot rule via admin interface.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    rule_id = data.get('rule_id')
+    question = data.get('question', '')  # Updated to use 'question' instead of 'keywords'
+    response = data.get('response', '')
+    user_type = data.get('user_type', 'user')
+
+    if not rule_id or not question or not response:
+        return jsonify({'status': 'error', 'message': 'Rule ID, question, and response are required'})
+
+    # Use chatbot's edit_rule method
+    edited = chatbot.edit_rule(rule_id, question, response, user_type)
+
+    if edited:
+        return jsonify({'status': 'success', 'message': 'Rule updated successfully'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Rule not found or could not be updated'})
+
+@app.route('/add_email', methods=['POST'])
+@login_required
+def add_email():
+    """
+    Add a new email entry to the email directory.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    school = data.get('school', '').strip()
+    email = data.get('email', '').strip()
+
+    if not school or not email:
+        return jsonify({'status': 'error', 'message': 'School and email are required'})
+
+    try:
+        email_id = email_directory.add_email(school, email)
+        return jsonify({'status': 'success', 'message': 'Email added successfully', 'id': email_id})
+    except Exception as e:
+        app.logger.error(f"Error adding email: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to add email: {str(e)}'})
+
+@app.route('/update_email', methods=['POST'])
+@login_required
+def update_email():
+    """
+    Update an existing email entry.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    email_id = data.get('id')
+    school = data.get('school', '').strip()
+    email = data.get('email', '').strip()
+
+    if not email_id or not school or not email:
+        return jsonify({'status': 'error', 'message': 'ID, school, and email are required'})
+
+    try:
+        updated = email_directory.update_email(email_id, school, email)
+        if updated:
+            return jsonify({'status': 'success', 'message': 'Email updated successfully'})
+        else:
+            return jsonify({'status': 'error', 'message': 'Email not found'})
+    except Exception as e:
+        app.logger.error(f"Error updating email: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to update email: {str(e)}'})
+
+@app.route('/delete_email', methods=['POST'])
+@login_required
+def delete_email():
+    """
+    Delete an email entry from the directory.
+    """
+    if not is_admin(current_user):
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    data = request.get_json()
+    email_id = data.get('id')
+
+    if not email_id:
+        return jsonify({'status': 'error', 'message': 'ID is required'})
+
+    try:
+        deleted = email_directory.delete_email(email_id)
+        if deleted:
+            return jsonify({'status': 'success', 'message': 'Email deleted successfully'})
+        else:
+            return jsonify({'status': 'error', 'message': 'Email not found'})
+    except Exception as e:
+        app.logger.error(f"Error deleting email: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to delete email: {str(e)}'})
+
+@app.route('/admin/login_logs')
+@login_required
+def admin_login_logs():
+    """
+    Render the admin login logs page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    from models import LoginLog
+    login_logs = LoginLog.query.filter(LoginLog.user_type.in_(['user', 'guest'])).order_by(LoginLog.timestamp.desc()).all()
+
+    # Format timestamps for display (convert UTC to local time UTC+8)
+    for log in login_logs:
+        local_time = log.timestamp + timedelta(hours=8)
+        log.formatted_timestamp = local_time.strftime('%B %d, %Y %H:%M')
+
+    return render_template('admin_login_logs.html', login_logs=login_logs)
+
+@app.route('/admin/login_logs/delete/<int:log_id>', methods=['DELETE'])
+@login_required
+def delete_login_log(log_id):
+    """
+    Delete a login log entry.
+    """
+    print(f"DEBUG: Delete route called for log_id: {log_id}")
+    if not is_admin(current_user):
+        print(f"DEBUG: Unauthorized access by user: {current_user}")
+        app.logger.warning(f"Unauthorized delete attempt by user: {current_user}")
+        return jsonify({'status': 'error', 'message': 'Unauthorized access'})
+
+    from models import LoginLog
+    log = LoginLog.query.get(log_id)
+    print(f"DEBUG: Log found: {log is not None}")
+    if not log:
+        print(f"DEBUG: Login log not found: ID {log_id}")
+        app.logger.warning(f"Login log not found: ID {log_id}")
+        return jsonify({'status': 'error', 'message': 'Log not found'})
+
+    print(f"DEBUG: Deleting login log: ID {log_id}, User Type: {log.user_type}, Identifier: {log.identifier}")
+    app.logger.info(f"Deleting login log: ID {log_id}, User Type: {log.user_type}, Identifier: {log.identifier}")
+
+    try:
+        db.session.delete(log)
+        db.session.commit()
+        print(f"DEBUG: Successfully deleted login log: ID {log_id}")
+        app.logger.info(f"Successfully deleted login log: ID {log_id}")
+        # Update chatbot rules in memory
+        chatbot.rules = chatbot.get_rules()
+        chatbot.guest_rules = chatbot.get_guest_rules()
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        db.session.rollback()
+        print(f"DEBUG: Error deleting login log: {str(e)}")
+        app.logger.error(f"Error deleting login log: {str(e)}")
+        return jsonify({'status': 'error', 'message': 'Failed to delete log'})
+
+@app.route('/admin/user_chat_history/<identifier>/<user_type>')
+@login_required
+def admin_user_chat_history(identifier, user_type):
+    """
+    Render the admin user chat history page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    from models import ChatMessage
+    if user_type == 'user':
+        # For users, find by email
+        from models import User
+        user = User.query.filter_by(email=identifier).first()
+        if user:
+            chat_messages = ChatMessage.query.filter_by(user_id=user.id).order_by(ChatMessage.timestamp.desc()).all()
+        else:
+            chat_messages = []
+    elif user_type == 'guest':
+        # For guests, find by guest_username
+        chat_messages = ChatMessage.query.filter_by(guest_username=identifier).order_by(ChatMessage.timestamp.desc()).all()
+    else:
+        chat_messages = []
+
+    # Group messages by session_id
+    chat_sessions = {}
+    for msg in chat_messages:
+        session_id = msg.session_id
+        if session_id not in chat_sessions:
+            chat_sessions[session_id] = []
+        chat_sessions[session_id].append(msg)
+
+    # Sort sessions by most recent message
+    sorted_sessions = sorted(chat_sessions.items(), key=lambda x: x[1][0].timestamp if x[1] else datetime.min, reverse=True)
+
+    return render_template('admin_user_chat_history.html', identifier=identifier, user_type=user_type, chat_sessions=sorted_sessions)
+
+@app.route('/submit_feedback', methods=['POST'])
+def submit_feedback():
+    """
+    Handle feedback submission from chat page and save to database.
+    """
+    from models import Feedback
+    data = request.get_json()
+    message = data.get('message', '').strip()
+
+    if not message:
+        return jsonify({'status': 'error', 'message': 'Feedback message is required'})
+
+    try:
+        feedback = Feedback(
+            user_id=current_user.id if current_user.is_authenticated else None,
+            message=message
+        )
+        db.session.add(feedback)
+        db.session.commit()
+        return jsonify({'status': 'success', 'message': 'Feedback submitted successfully'})
+    except Exception as e:
+        app.logger.error(f"Error submitting feedback: {str(e)}")
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': 'Failed to submit feedback'})
+
+@app.route('/admin/json_editor')
+@login_required
+def admin_json_editor():
+    """
+    Render the admin JSON editor page.
+    """
+    if not is_admin(current_user):
+        flash('Unauthorized access', 'danger')
+        return redirect(url_for('chat'))
+
+    return render_template('admin_json_editor.html')
 
 if __name__ == '__main__':
-    main()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
