@@ -39,24 +39,8 @@ app.secret_key = safe_get_env("SESSION_SECRET", "dev-secret-key-railway-safe")
 
 # Defer instance directory creation to startup
 
-def get_database_urls():
-    """Get database URLs at runtime to ensure environment variables are available"""
-    # Debug: Log all MySQL-related environment variables
-    mysql_env_vars = {k: v for k, v in os.environ.items() if 'mysql' in k.lower() or 'database' in k.lower()}
-    app.logger.info(f"Available MySQL/Database environment variables: {mysql_env_vars}")
-
-    # Add SQLAlchemy configuration for MySQL
-    mysql_url = os.environ.get('MYSQL_URL')
-    if mysql_url and mysql_url.startswith('mysql://'):
-        mysql_url = mysql_url.replace('mysql://', 'mysql+pymysql://', 1)
-
-    # SQLite fallback databases (only for development/local testing)
-    sqlite_user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
-sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
-
 def construct_railway_mysql_url():
     """Construct MySQL URL from Railway environment variables"""
-
     host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
     port = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
     user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
@@ -77,16 +61,28 @@ def construct_railway_mysql_url():
     app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name}")
     return url
 
-mysql_url = construct_railway_mysql_url()
-if mysql_url:
-    user_db_url = mysql_url
-    chatbot_db_url = mysql_url
-else:
-    user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
-    chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
-app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
+def get_database_urls():
+    """Get database URLs at runtime to ensure environment variables are available"""
+    # Debug: Log all MySQL-related environment variables
+    mysql_env_vars = {k: v for k, v in os.environ.items() if 'mysql' in k.lower() or 'database' in k.lower()}
+    app.logger.info(f"Available MySQL/Database environment variables: {mysql_env_vars}")
 
-return user_db_url, chatbot_db_url
+    # Try to construct Railway MySQL URL
+    mysql_url = construct_railway_mysql_url()
+    
+    # SQLite fallback databases (only for development/local testing)
+    sqlite_user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+    sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
+
+    if mysql_url:
+        user_db_url = mysql_url
+        chatbot_db_url = mysql_url
+    else:
+        user_db_url = sqlite_user_db_url
+        chatbot_db_url = sqlite_chatbot_db_url
+    
+    app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
+    return user_db_url, chatbot_db_url
 
 # Basic config - defer full DB setup to startup
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
