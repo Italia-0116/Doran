@@ -5,77 +5,130 @@ import logging
 
 class ChatbotDB:
     def __init__(self):
-        # Use environment variables for MySQL connection, defaulting to Railway
-        host = os.environ.get('MYSQL_HOST', 'trolley.proxy.rlwy.net')
-        port = int(os.environ.get('MYSQL_PORT', '10349'))
-        user = os.environ.get('MYSQL_USER', 'root')
-        password = os.environ.get('MYSQL_PASSWORD', 'smxcYzdpwUJTAiRdJWQFPJNbfsbVTAGC')
-        database = os.environ.get('MYSQL_DATABASE', 'railway')
+        import urllib.parse
+        
+        def get_railway_mysql_params():
+            """Detect Railway MySQL environment variables"""
+            host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
+            port_str = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
+            user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
+            password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD')
+            database = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or 'railway'
+            
+            if all([host, port_str, user, password]):
+                return host, int(port_str), user, password, database
+            return None
 
-        self.conn = mysql.connector.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=database
-        )
-        self.cursor = self.conn.cursor(dictionary=True)
+        mysql_params = get_railway_mysql_params()
+        self.use_mysql = mysql_params is not None
+
+        self.conn = None
+        self.cursor = None
+        
+        if self.use_mysql:
+            host, port, user, password, database = mysql_params
+
+        if self.use_mysql:
+            try:
+                self.conn = mysql.connector.connect(
+                    host=host,
+                    port=port,
+                    user=user,
+                    password=password,
+                    database=database,
+                    connection_timeout=30,
+                    ssl_disabled=False,
+                    ssl_verify_cert=False,
+                    ssl_verify_identity=False,
+                    autocommit=True,
+                    charset='utf8mb4'
+                )
+                self.cursor = self.conn.cursor(dictionary=True)
+                logging.info("ChatbotDB MySQL connection established")
+            except Exception as e:
+                logging.warning(f"ChatbotDB MySQL connection failed: {e}")
+                logging.info("ChatbotDB will operate in fallback mode")
+                self.use_mysql = False
+        else:
+            logging.info("No MySQL config detected - operating in fallback mode")
 
     def get_user_rules(self):
-        self.cursor.execute("SELECT * FROM user_rules")
-        return self.cursor.fetchall()
+        if not self.cursor:
+            logging.warning("ChatbotDB not connected, returning empty list")
+            return []
+        try:
+            self.cursor.execute("SELECT * FROM user_rules")
+            return self.cursor.fetchall()
+        except Exception as e:
+            logging.warning(f"Failed to get user rules: {e}")
+            return []
 
     def get_guest_rules(self):
-        self.cursor.execute("SELECT * FROM guest_rules")
-        return self.cursor.fetchall()
+        if not self.cursor:
+            logging.warning("ChatbotDB not connected, returning empty list")
+            return []
+        try:
+            self.cursor.execute("SELECT * FROM guest_rules")
+            return self.cursor.fetchall()
+        except Exception as e:
+            logging.warning(f"Failed to get guest rules: {e}")
+            return []
 
     def get_location_rules(self):
         """
         Get location rules from database and format them properly.
         Parses JSON questions and constructs HTML responses with images.
         """
-        self.cursor.execute("SELECT * FROM locations")
-        locations = self.cursor.fetchall()
+        if not self.cursor:
+            logging.warning("ChatbotDB not connected, returning empty list")
+            return []
         
-        formatted_locations = []
-        for loc in locations:
-            # Parse JSON questions
-            import json
-            questions = json.loads(loc.get('questions', '[]')) if isinstance(loc.get('questions'), str) else loc.get('questions', [])
-            urls = json.loads(loc.get('urls', '[]')) if isinstance(loc.get('urls'), str) else loc.get('urls', [])
+        try:
+            self.cursor.execute("SELECT * FROM locations")
+            locations = self.cursor.fetchall()
             
-            # Flatten questions if nested
-            flattened_questions = []
-            for q in questions:
-                if isinstance(q, list):
-                    flattened_questions.extend(q)
-                elif isinstance(q, str):
-                    flattened_questions.append(q)
+            formatted_locations = []
+            for loc in locations:
+                # Parse JSON questions
+                import json
+                questions = json.loads(loc.get('questions', '[]')) if isinstance(loc.get('questions'), str) else loc.get('questions', [])
+                urls = json.loads(loc.get('urls', '[]')) if isinstance(loc.get('urls'), str) else loc.get('urls', [])
+                
+                # Flatten questions if nested
+                flattened_questions = []
+                for q in questions:
+                    if isinstance(q, list):
+                        flattened_questions.extend(q)
+                    elif isinstance(q, str):
+                        flattened_questions.append(q)
+                
+                # Construct HTML response with images
+                description = loc.get('description', '')
+                response = description
+                
+                if urls:
+                    response += "<br>"
+                    for url in urls:
+                        # Ensure proper path format
+                        if not url.startswith('/static/'):
+                            url = f"/static/{url}"
+                        response += f"<img src='{url}' alt='Location Image' class='message-image'>"
+                
+                formatted_loc = {
+                    'id': loc.get('id'),
+                    'category': 'locations',
+                    'questions': flattened_questions,
+                    'question': ' '.join(flattened_questions) if flattened_questions else '',
+                    'response': response,
+                    'answer': response,
+                    'user_type': loc.get('user_type', 'both')
+                }
+                formatted_locations.append(formatted_loc)
             
-            # Construct HTML response with images
-            description = loc.get('description', '')
-            response = description
-            
-            if urls:
-                response += "<br>"
-                for url in urls:
-                    # Ensure proper path format
-                    if not url.startswith('/static/'):
-                        url = f"/static/{url}"
-                    response += f"<img src='{url}' alt='Location Image' class='message-image'>"
-            
-            formatted_loc = {
-                'id': loc.get('id'),
-                'category': 'locations',
-                'questions': flattened_questions,
-                'question': ' '.join(flattened_questions) if flattened_questions else '',
-                'response': response,
-                'answer': response,
-                'user_type': loc.get('user_type', 'both')
-            }
-            formatted_locations.append(formatted_loc)
-        
-        return formatted_locations
+            return formatted_locations
+        except Exception as e:
+            logging.warning(f"Failed to get location rules: {e}")
+            return []
 
     def get_visual_rules(self):
         """
