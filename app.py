@@ -40,25 +40,42 @@ app.secret_key = safe_get_env("SESSION_SECRET", "dev-secret-key-railway-safe")
 # Defer instance directory creation to startup
 
 def construct_railway_mysql_url():
-    """Construct MySQL URL from Railway environment variables"""
-    host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
-    port = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
-    user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
-    password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD')
-    db_name = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or 'railway'
+    """Construct MySQL URL from Railway environment variables with improved detection"""
+    # Comprehensive Railway var detection
+    host = (os.environ.get('MYSQLHOST') or 
+            os.environ.get('MYSQL_HOST') or 
+            os.environ.get('DATABASE_HOST'))
+    port_str = (os.environ.get('MYSQLPORT') or 
+                os.environ.get('MYSQL_PORT') or 
+                os.environ.get('DATABASE_PORT', '3306'))
+    user = (os.environ.get('MYSQLUSER') or 
+            os.environ.get('MYSQL_USER') or 
+            os.environ.get('DATABASE_USER'))
+    password = (os.environ.get('MYSQLPASSWORD') or 
+                os.environ.get('MYSQL_ROOT_PASSWORD') or 
+                os.environ.get('DATABASE_PASSWORD'))
+    db_name = (os.environ.get('MYSQLDATABASE') or 
+               os.environ.get('MYSQL_DATABASE') or 
+               os.environ.get('DATABASE_NAME') or 'railway')
 
-    if not all([host, port, user, password]):
-        app.logger.warning("Missing required Railway MySQL env vars")
+    if not all([host, port_str, user, password]):
+        app.logger.warning(f"Missing Railway MySQL vars: host={bool(host)}, port={bool(port_str)}, user={bool(user)}, pw={bool(password)}")
         return None
 
-    port = int(port)
-    # Fix for external IPv6: use proxy if internal host
-    if 'railway.internal' in host:
-        host = 'hopper.proxy.rlwy.net'
-        port = 10123  # Use public proxy port
+    port = int(port_str)
+    
+    # Enhanced proxy routing for Railway internal/external
+    original_host = host
+    if 'railway.internal' in host.lower() or host.startswith('127.') or '::1' in host:
+        # Internal IPv6/Localhost → use public proxy
+        host = os.environ.get('MYSQL_PROXY_HOST', 'hopper.proxy.rlwy.net')
+        port = int(os.environ.get('MYSQL_PROXY_PORT', '10123'))
+        app.logger.info(f"Internal host {original_host} → proxy {host}:{port}")
 
-    url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4'
-    app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name}")
+    # Add SSL params to connection string for Railway
+    ssl_params = "ssl_disabled=0&ssl_verify_cert=0&ssl_verify_identity=0"
+    url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4&{ssl_params}'
+    app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name} (from {original_host})")
     return url
 
 def get_database_urls():
@@ -159,13 +176,16 @@ def initialize_databases():
         # Set MySQL-specific connect_args now that we know the DB type
         if user_db_url.startswith('mysql'):
             mysql_connect_args = {
-                'connect_timeout': 30,
+                'connection_timeout': 30,
                 'read_timeout': 30,
                 'write_timeout': 30,
                 'autocommit': True,
                 'charset': 'utf8mb4',
                 'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
                 'client_flag': 4,  # caching_sha2_password
+                'ssl_disabled': False,
+                'ssl_verify_cert': False,
+                'ssl_verify_identity': False,
             }
             current_options = app.config['SQLALCHEMY_ENGINE_OPTIONS']
             current_options['connect_args'] = mysql_connect_args
@@ -196,21 +216,28 @@ def safe_startup_init():
     
     try:
         with app.app_context():
-            # Create tables
-            db.create_all()
-            
-            # Update DB configs
+            # Update DB configs FIRST, before creating tables
             initialize_databases()
+            
+            # Create tables with correct config
+            db.create_all()
             
             # Volume sync
             safe_auto_upload_json_files()
             
-            # Migrations
+            # Migrations (with graceful fallback for SQLite)
             auto_migrate_json_to_db()
             
             # Init managers
             user_manager = UserManager(db)
-            chatbot_db = ChatbotDB()
+            
+            # Try to init ChatbotDB, but don't fail if MySQL isn't available
+            try:
+                chatbot_db = ChatbotDB()
+            except Exception as cb_err:
+                app.logger.warning(f"ChatbotDB MySQL connection failed, continuing with SQLite: {cb_err}")
+                chatbot_db = None
+            
             chatbot = Chatbot()
             
             app.logger.info("Full startup initialization completed")
@@ -288,15 +315,24 @@ with app.app_context():
         """
         Automatically migrate JSON files to database tables on startup if tables are empty.
         Also fixes email_directory schema and populates sample emails.
+        Supports FORCE_MIGRATE env var (true/full) to force migration.
         """
         try:
-            # First, fix email_directory schema if needed
-            from fix_database_schema import fix_email_directory_table
-            try:
-                fix_email_directory_table(db.engine)
-                app.logger.info("Email directory schema fix completed")
-            except Exception as e:
-                app.logger.warning(f"Email directory schema fix failed (continuing): {str(e)}")
+            force_migrate = os.environ.get('FORCE_MIGRATE', 'false').lower() == 'true'
+            truncate_tables = os.environ.get('FORCE_MIGRATE', 'false').lower() == 'full'
+
+            app.logger.info(f"Auto-migrate started. FORCE_MIGRATE={os.environ.get('FORCE_MIGRATE', 'false')}, truncate={truncate_tables}")
+
+            # First, fix email_directory schema if needed (MySQL only)
+            if user_db_url.startswith('mysql'):
+                from fix_database_schema import fix_email_directory_table
+                try:
+                    fix_email_directory_table(db.engine)
+                    app.logger.info("Email directory schema fix completed")
+                except Exception as e:
+                    app.logger.warning(f"Email directory schema fix failed (continuing): {str(e)}")
+            else:
+                app.logger.info("Using SQLite - skipping MySQL schema fixes")
 
             # Check if chatbot database tables are empty
             from chatbot_models import Faq, Location, Visual, UserRule, GuestRule, EmailDirectory
@@ -307,9 +343,32 @@ with app.app_context():
             guest_rule_count = GuestRule.query.count()
             email_count = EmailDirectory.query.count()
 
-            # If tables are empty, run migration
-            if faq_count == 0 and location_count == 0 and visual_count == 0 and user_rule_count == 0 and guest_rule_count == 0:
-                app.logger.info("Database tables appear empty, running JSON to database migration...")
+            app.logger.info(f"Current table counts - FAQ:{faq_count}, Locations:{location_count}, Visuals:{visual_count}, UserRules:{user_rule_count}, GuestRules:{guest_rule_count}, Emails:{email_count}")
+
+            should_migrate = force_migrate or (faq_count == 0 and location_count == 0 and visual_count == 0 and user_rule_count == 0 and guest_rule_count == 0)
+
+            if should_migrate:
+                if force_migrate:
+                    app.logger.info("FORCE_MIGRATE enabled, proceeding with migration (truncate=" + str(truncate_tables) + ")")
+                else:
+                    app.logger.info("Database tables empty, running JSON to database migration...")
+
+                if truncate_tables:
+                    app.logger.info("TRUNCATE mode: Clearing all chatbot tables before migration")
+                    try:
+                        Faq.__table__.drop(db.engine, checkfirst=True)
+                        Location.__table__.drop(db.engine, checkfirst=True)
+                        Visual.__table__.drop(db.engine, checkfirst=True)
+                        UserRule.__table__.drop(db.engine, checkfirst=True)
+                        GuestRule.__table__.drop(db.engine, checkfirst=True)
+                        Category.__table__.drop(db.engine, checkfirst=True)
+                        db.create_all()
+                        app.logger.info("Tables truncated and recreated")
+                    except Exception as e:
+                        app.logger.error(f"Table truncate failed: {e}")
+                        return
+
+                # Import migration functions
 
                 # Import migration functions
                 from migrate_all_json_to_mysql import (
@@ -322,45 +381,82 @@ with app.app_context():
                     create_sqlalchemy_tables()
                     app.logger.info("Database tables created successfully for migration")
 
-                    # Determine the correct base path - use volume if mounted, otherwise local
-                    volume_path = '/app/database'
-                    local_db_path = os.path.join(app.root_path, 'database')
+                # Determine the correct base path - use volume if mounted, otherwise local
+                volume_path = '/app/database'
+                local_db_path = os.path.join(app.root_path, 'database')
 
-                    # Use volume path if it exists and is readable, otherwise use local path
-                    if os.path.exists(volume_path) and os.access(volume_path, os.R_OK):
-                        base_path = volume_path
-                        app.logger.info("Using Railway volume path for migration: /app/database")
-                    else:
-                        base_path = local_db_path
-                        app.logger.info("Using local database path for migration")
+                # Use volume path if it exists and is readable, otherwise use local path
+                if os.path.exists(volume_path) and os.access(volume_path, os.R_OK):
+                    base_path = volume_path
+                    app.logger.info(f"Using Railway volume path for migration: {base_path}")
+                else:
+                    base_path = local_db_path
+                    app.logger.info(f"Using local database path for migration: {base_path}")
 
-                    # Check if JSON files exist before migration
-                    faqs_path = os.path.join(base_path, 'faqs.json')
-                    locations_path = os.path.join(base_path, 'locations', 'locations.json')
-                    visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
+                # Check key JSON files
+                faqs_path = os.path.join(base_path, 'faqs.json')
+                locations_path = os.path.join(base_path, 'locations', 'locations.json')
+                visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
+                categories_path = os.path.join(base_path, 'categories.json')
+                user_rules_path = os.path.join(base_path, 'user_database', 'all_user_rules.json')
+                guest_rules_path = os.path.join(base_path, 'guest_database', 'all_guest_rules.json')
 
-                    app.logger.info(f"Checking for JSON files - FAQs: {os.path.exists(faqs_path)}, Locations: {os.path.exists(locations_path)}, Visuals: {os.path.exists(visuals_path)}")
+                file_exists = {
+                    'categories.json': os.path.exists(categories_path),
+                    'faqs.json': os.path.exists(faqs_path),
+                    'locations.json': os.path.exists(locations_path),
+                    'visuals.json': os.path.exists(visuals_path),
+                    'user_rules.json': os.path.exists(user_rules_path),
+                    'guest_rules.json': os.path.exists(guest_rules_path)
+                }
+                app.logger.info(f"JSON files found: {file_exists}")
+
+                if not any(file_exists.values()):
+                    app.logger.warning("No JSON files found at base_path, skipping migration")
+                    return
 
                     # Migrate data
-                    app.logger.info("Starting category migration...")
-                    migrate_categories(base_path)
+                # Import migration functions
+                from migrate_all_json_to_mysql import (
+                    migrate_categories, migrate_email_directory,
+                    migrate_faqs, migrate_locations, migrate_visuals, migrate_rules
+                )
 
-                    app.logger.info("Starting email directory migration...")
-                    migrate_email_directory(base_path)
+                try:
+                    # Create tables first
+                    from migrate_all_json_to_mysql import create_sqlalchemy_tables
+                    create_sqlalchemy_tables()
+                    app.logger.info("Database tables created successfully")
 
-                    app.logger.info("Starting FAQs migration...")
-                    migrate_faqs(base_path)
+                    # Migrate data with individual error handling
+                    migrations = [
+                        ("categories", lambda: migrate_categories(base_path)),
+                        ("email_directory", lambda: migrate_email_directory(base_path)),
+                        ("faqs", lambda: migrate_faqs(base_path)),
+                        ("locations", lambda: migrate_locations(base_path)),
+                        ("visuals", lambda: migrate_visuals(base_path)),
+                        ("rules", lambda: migrate_rules(base_path))
+                    ]
 
-                    app.logger.info("Starting locations migration...")
-                    migrate_locations(base_path)
+                    success_count = 0
+                    for name, migrate_func in migrations:
+                        try:
+                            app.logger.info(f"Starting {name} migration...")
+                            migrate_func()
+                            app.logger.info(f"{name} migration completed successfully")
+                            success_count += 1
+                        except Exception as e:
+                            app.logger.error(f"{name} migration failed: {str(e)}")
+                            import traceback
+                            app.logger.error(traceback.format_exc())
 
-                    app.logger.info("Starting visuals migration...")
-                    migrate_visuals(base_path)
+                    app.logger.info(f"Migration summary: {success_count}/6 completed successfully")
 
-                    app.logger.info("Starting rules migration...")
-                    migrate_rules(base_path)
-
-                    app.logger.info("JSON to database migration completed successfully!")
+                except Exception as e:
+                    app.logger.error(f"Table creation or migration setup failed: {str(e)}")
+                    import traceback
+                    app.logger.error(traceback.format_exc())
+                    db.session.rollback()
 
                 except Exception as e:
                     app.logger.error(f"Migration failed: {str(e)}")
@@ -369,7 +465,7 @@ with app.app_context():
                     db.session.rollback()
 
             else:
-                app.logger.info("Database tables already contain data, skipping migration")
+            app.logger.info("Database tables contain data and no force migrate, skipping migration")
 
             # Always populate email directory if empty, regardless of other tables
             if email_count == 0:
@@ -380,6 +476,15 @@ with app.app_context():
                     app.logger.info("Email directory populated successfully")
                 except Exception as e:
                     app.logger.error(f"Failed to populate email directory: {str(e)}")
+
+            # Final count verification (after all operations)
+            final_faq = Faq.query.count()
+            final_location = Location.query.count()
+            final_visual = Visual.query.count()
+            final_user_rule = UserRule.query.count()
+            final_guest_rule = GuestRule.query.count()
+            final_email = EmailDirectory.query.count()
+            app.logger.info(f"Final table counts - FAQ:{final_faq}, Locations:{final_location}, Visuals:{final_visual}, UserRules:{final_user_rule}, GuestRules:{final_guest_rule}, Emails:{final_email}")
 
         except Exception as e:
             app.logger.error(f"Error during auto-migration check: {str(e)}")
