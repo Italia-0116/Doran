@@ -411,6 +411,16 @@ class Chatbot:
 
             tokens = simple_tokenize(user_input.lower())
 
+            # Handle thanks/thank you with welcome message
+            thanks_keywords = ['thanks', 'thank', 'thankyou', 'ty', 'thx', 'cheers']
+            if any(word in tokens for word in thanks_keywords):
+                welcome_response = "You're welcome! 😊 How else can I assist you today? Feel free to ask about locations, emails, or anything DORAN-related!"
+                self.consecutive_fallbacks = 0  # Reset fallback counter
+                self.response_cache[cache_key] = welcome_response
+                if session_id:
+                    self.update_context(session_id, user_input, welcome_response)
+                return self.append_image_to_response(welcome_response)
+
             # 1. PRIORITY: Email search (SOICT email, registrar email, etc.)
             if any(kw in tokens for kw in self.email_keywords):
                 email_response = self.search_emails(user_input)
