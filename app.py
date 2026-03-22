@@ -52,43 +52,41 @@ def get_database_urls():
 
     # SQLite fallback databases (only for development/local testing)
     sqlite_user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
-    sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
+sqlite_chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
 
-    def construct_railway_mysql_url():
-        """Construct MySQL URL from Railway environment variables"""
+def construct_railway_mysql_url():
+    """Construct MySQL URL from Railway environment variables"""
 
-        host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
-        port = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
-        user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
-        password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD')
-        db_name = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or 'railway'
+    host = os.environ.get('MYSQLHOST') or os.environ.get('MYSQL_HOST')
+    port = os.environ.get('MYSQLPORT') or os.environ.get('MYSQL_PORT')
+    user = os.environ.get('MYSQLUSER') or os.environ.get('MYSQL_USER')
+    password = os.environ.get('MYSQLPASSWORD') or os.environ.get('MYSQL_ROOT_PASSWORD')
+    db_name = os.environ.get('MYSQLDATABASE') or os.environ.get('MYSQL_DATABASE') or 'railway'
 
-        if not all([host, port, user, password]):
-            app.logger.warning("Missing required Railway MySQL env vars")
-            return None
+    if not all([host, port, user, password]):
+        app.logger.warning("Missing required Railway MySQL env vars")
+        return None
 
-        return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}"
+    port = int(port)
+    # Fix for external IPv6: use proxy if internal host
+    if 'railway.internal' in host:
+        host = 'hopper.proxy.rlwy.net'
+        port = 10123  # Use public proxy port
 
-        port = int(port_str)
-        # Fix for external IPv6: use proxy if internal host
-        if 'railway.internal' in host:
-            host = 'hopper.proxy.rlwy.net'
-            port_str = safe_get_env('MYSQLPORT') or '10123'  # Use public proxy port
+    url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4'
+    app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name}")
+    return url
 
-        url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4'
-        app.logger.info(f"MySQL URL: {user}:***@{host}:{port}/{db_name}")
-        return url
+mysql_url = construct_railway_mysql_url()
+if mysql_url:
+    user_db_url = mysql_url
+    chatbot_db_url = mysql_url
+else:
+    user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
+    chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
+app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
 
-    mysql_url = construct_railway_mysql_url()
-    if mysql_url:
-        user_db_url = mysql_url
-        chatbot_db_url = mysql_url
-    else:
-        user_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
-        chatbot_db_url = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
-    app.logger.info(f"Final database URLs - user: {user_db_url}, chatbot: {chatbot_db_url}")
-
-    return user_db_url, chatbot_db_url
+return user_db_url, chatbot_db_url
 
 # Basic config - defer full DB setup to startup
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -96,19 +94,7 @@ app.config['SQLALCHEMY_ECHO'] = False
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
 app.config['CHATBOT_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
 
-# Use the custom engine for all database operations
-# Conditional connect_args for MySQL only (SQLite doesn't support)
-is_mysql = app.config['SQLALCHEMY_DATABASE_URI'].startswith('mysql')
-mysql_connect_args = {
-    'connect_timeout': 30,
-    'read_timeout': 30,
-    'write_timeout': 30,
-    'autocommit': True,
-    'charset': 'utf8mb4',
-    'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
-    'client_flag': 4,  # caching_sha2_password
-} if is_mysql else {}
-
+# Defer MySQL connect_args setup to initialize_databases() where user_db_url is available
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 30,
@@ -116,7 +102,7 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'max_overflow': 0,
     'pool_timeout': 30,
     'pool_reset_on_return': 'rollback',
-    'connect_args': mysql_connect_args
+    # connect_args set dynamically in initialize_databases()
 }
 
 # Configure binds for multiple databases
@@ -169,28 +155,37 @@ def initialize_databases():
     global user_db_url, chatbot_db_url
     ensure_instance_dir()
     
-    # Use get_database_urls() safely
+    try:
+        user_db_url, chatbot_db_url = get_database_urls()
+        app.config['SQLALCHEMY_DATABASE_URI'] = user_db_url
+        app.config['CHATBOT_DATABASE_URI'] = chatbot_db_url
+        
+        # Set MySQL-specific connect_args now that we know the DB type
+        if user_db_url.startswith('mysql'):
+            mysql_connect_args = {
+                'connect_timeout': 30,
+                'read_timeout': 30,
+                'write_timeout': 30,
+                'autocommit': True,
+                'charset': 'utf8mb4',
+                'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
+                'client_flag': 4,  # caching_sha2_password
+            }
+            current_options = app.config['SQLALCHEMY_ENGINE_OPTIONS']
+            current_options['connect_args'] = mysql_connect_args
+            app.config['SQLALCHEMY_ENGINE_OPTIONS'] = current_options
+            app.logger.info("MySQL connect_args configured")
+        else:
+            app.logger.info("SQLite - no special connect_args needed")
+            
+        app.logger.info("Database URLs and engine options set successfully")
+    except Exception as e:
 try:
-    database_url = os.environ.get("DATABASE_URL")
-
-    if database_url and database_url.startswith("mysql://"):
-        database_url = database_url.replace("mysql://", "mysql+pymysql://", 1)
-
-    if database_url:
-        app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-        app.config['CHATBOT_DATABASE_URI'] = database_url
-        app.logger.info("Using Railway DATABASE_URL")
-    else:
-        raise Exception("DATABASE_URL not found")
-
-except Exception as e:
-    app.logger.error(f"DB URL setup failed, using SQLite: {e}")
-
-    sqlite_user = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'doran.db').replace('\\', '/')
-    sqlite_chatbot = 'sqlite:///' + os.path.join(app.root_path, 'instance', 'chatbot.db').replace('\\', '/')
-
-    app.config['SQLALCHEMY_DATABASE_URI'] = sqlite_user
-    app.config['CHATBOT_DATABASE_URI'] = sqlite_chatbot
+    user_db_url, chatbot_db_url = get_database_urls()
+    app.config['SQLALCHEMY_DATABASE_URI'] = user_db_url
+    app.config['CHATBOT_DATABASE_URI'] = chatbot_db_url
+    app.logger.info("Database URLs set successfully")
+        try:
 
 def safe_auto_upload_json_files():
     """Upload JSON files to Railway volume - optional"""
@@ -229,11 +224,14 @@ def safe_startup_init():
             app.logger.info("Full startup initialization completed")
     except Exception as e:
         app.logger.error(f"Startup init partial failure (continuing): {e}")
+        raise
 
-# Register startup hook
-@app.before_first_request
+# Register startup hook - runs once on first request (Flask 2.3+ compatible)
+@app.before_request
 def startup_init():
-    safe_startup_init()
+    if not app.config.get('startup_initialized', False):
+        safe_startup_init()
+        app.config['startup_initialized'] = True
 
 # Auto-upload JSON files to Railway volume on startup (now safe wrapper exists)
 def auto_upload_json_files():
