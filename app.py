@@ -223,13 +223,7 @@ def safe_startup_init():
             # Create ALL tables with correct config (both model sets now imported)
             db.create_all()
             
-            # Explicitly create chatbot_db bind tables if separate
-            if 'chatbot_db' in app.config['SQLALCHEMY_BINDS']:
-                with db.engine.connect() as conn:
-                    conn.execute("CREATE TABLE IF NOT EXISTS faqs LIKE (SELECT * FROM information_schema.tables LIMIT 0)")
-                    conn.execute("CREATE TABLE IF NOT EXISTS locations LIKE (SELECT * FROM information_schema.tables LIMIT 0)")
-                    # Note: Full db.create_all(bind='chatbot_db') after confirming models bind
-                
+            # Tables created for both binds - SQLAlchemy handles __bind_key__
             app.logger.info("All database tables created successfully")
             
             # Volume sync
