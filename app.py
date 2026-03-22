@@ -180,12 +180,8 @@ def initialize_databases():
             
         app.logger.info("Database URLs and engine options set successfully")
     except Exception as e:
-try:
-    user_db_url, chatbot_db_url = get_database_urls()
-    app.config['SQLALCHEMY_DATABASE_URI'] = user_db_url
-    app.config['CHATBOT_DATABASE_URI'] = chatbot_db_url
-    app.logger.info("Database URLs set successfully")
-        try:
+        app.logger.error(f"DB initialization failed: {e}")
+        raise
 
 def safe_auto_upload_json_files():
     """Upload JSON files to Railway volume - optional"""
