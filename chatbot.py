@@ -403,50 +403,88 @@ class Chatbot:
             str: The chatbot's response from rules, info.json, or fallback message.
         """
     def get_response(self, user_input, user_role="guest", session_id=None):
+        try:
+            # Cache key
+            cache_key = f"{user_role}:{user_input.lower().strip()}"
+            if cache_key in self.response_cache:
+                return self.append_image_to_response(self.response_cache[cache_key])
 
-            try:
-                # Cache key
-                cache_key = f"{user_role}:{user_input.lower().strip()}"
-                if cache_key in self.response_cache:
-                    return self.append_image_to_response(self.response_cache[cache_key])
+            tokens = simple_tokenize(user_input.lower())
 
-                # Detect intent
-                intent = classify_intent(user_input)
+            # 1. PRIORITY: Email search (SOICT email, registrar email, etc.)
+            if any(kw in tokens for kw in self.email_keywords):
+                email_response = self.search_emails(user_input)
+                if email_response:
+                    self.consecutive_fallbacks = 0
+                    if session_id:
+                        self.update_context(session_id, user_input, email_response)
+                    self.response_cache[cache_key] = email_response
+                    return self.append_image_to_response(email_response)
 
-                # Select rules
+            # 2. "Who can I contact?" / "contacts" → full directory
+            contact_keywords = ["contact", "who", "reach", "emails", "directory"]
+            if any(kw in tokens for kw in contact_keywords):
+                all_emails = self.cached_emails
+                if all_emails:
+                    response = "You can contact these offices:\n"
+                    for entry in all_emails[:6]:  # Show top 6
+                        response += f"• {entry['school']}: <strong>{entry['email']}</strong>\n"
+                    response += "\nAsk me about specific offices like 'SOICT email' for more!"
+                    self.consecutive_fallbacks = 0
+                    if session_id:
+                        self.update_context(session_id, user_input, response)
+                    self.response_cache[cache_key] = response
+                    return self.append_image_to_response(response)
+
+            # Detect intent
+            intent = classify_intent(user_input)
+
+            # Filter rules by user_type/role
+            def filter_rules_by_role(rules_list):
                 if user_role == "guest":
-                    rules_to_use = (
-                        self.guest_rules +
-                        self.location_rules +
-                        self.visual_rules +
-                        self.faq_rules
-                    )
+                    return [r for r in rules_list if r.get('user_type') in ['both', 'guest']]
                 else:
-                    rules_to_use = (
-                        self.rules +
-                        self.location_rules +
-                        self.visual_rules +
-                        self.faq_rules
-                    )
+                    return [r for r in rules_list if r.get('user_type') in ['both', 'user']]
 
-                # ---------------------------------------------------
-                # NEW NLP ENGINE REPLACEMENT BLOCK STARTS HERE
-                # ---------------------------------------------------
+            # Select & filter rules by role
+            guest_rules_filtered = filter_rules_by_role(self.guest_rules)
+            rules_filtered = filter_rules_by_role(self.rules)
+            location_rules_filtered = filter_rules_by_role(self.location_rules)
+            visual_rules_filtered = filter_rules_by_role(self.visual_rules)
 
-                processed_query = self.nlu.preprocess(user_input)
-
-                # Combine all rules for unified search
-                all_rules = (
-                    self.rules +
-                    self.guest_rules +
-                    self.location_rules +
-                    self.visual_rules +
+            if user_role == "guest":
+                rules_to_use = (
+                    guest_rules_filtered +
+                    location_rules_filtered +
+                    visual_rules_filtered +
+                    self.faq_rules
+                )
+            else:
+                rules_to_use = (
+                    rules_filtered +
+                    location_rules_filtered +
+                    visual_rules_filtered +
                     self.faq_rules
                 )
 
-                best_rule, score = self.nlu.match_rule(processed_query, all_rules)
+            # ---------------------------------------------------
+            # NEW NLP ENGINE REPLACEMENT BLOCK STARTS HERE
+            # ---------------------------------------------------
 
-                if best_rule:
+            processed_query = self.nlu.preprocess(user_input)
+
+            # Combine FILTERED rules for unified search
+            all_rules = (
+                rules_filtered +
+                guest_rules_filtered +
+                location_rules_filtered +
+                visual_rules_filtered +
+                self.faq_rules
+            )
+
+            best_rule, score = self.nlu.match_rule(processed_query, all_rules)
+
+            if best_rule:
                     self.consecutive_fallbacks = 0
 
                     # Determine the response text from rule
@@ -466,32 +504,28 @@ class Chatbot:
                     # If rule has images or visual data, include it
                     return self.append_image_to_response(response, best_rule.get("questions"))
 
-                # ---------------------------------------------------
-                # NEW NLP ENGINE BLOCK ENDS HERE
-                # ---------------------------------------------------
+            # ---------------------------------------------------
+            # NEW NLP ENGINE BLOCK ENDS HERE
+            # ---------------------------------------------------
 
-                # Fallback responses
-                logging.info("No matches found, using fallback")
-                self.consecutive_fallbacks += 1
-                fallback = self.fallback_responses[self.fallback_index]
-                self.fallback_index = (self.fallback_index + 1) % len(self.fallback_responses)
+            # Fallback responses
+            logging.info("No matches found, using fallback")
+            self.consecutive_fallbacks += 1
+            fallback = self.fallback_responses[self.fallback_index]
+            self.fallback_index = (self.fallback_index + 1) % len(self.fallback_responses)
 
-                if session_id:
-                    self.update_context(session_id, user_input, fallback)
+            if session_id:
+                self.update_context(session_id, user_input, fallback)
+            self.response_cache[cache_key] = fallback
+            return self.append_image_to_response(fallback)
 
-                # Cache fallback
-                self.response_cache[cache_key] = fallback
-                return self.append_image_to_response(fallback)
-
-            except Exception as e:
-                logging.error(f"Error in get_response: {e}", exc_info=True)
-                fallback = "I'm sorry, I encountered an error. Please try again."
-
-                if session_id:
-                    self.update_context(session_id, user_input, fallback)
-
-                self.response_cache[cache_key] = fallback
-                return fallback
+        except Exception as e:
+            logging.error(f"Error in get_response: {e}", exc_info=True)
+            fallback = "I'm sorry, I encountered an error. Please try again."
+            if session_id:
+                self.update_context(session_id, user_input, fallback)
+            self.response_cache[cache_key] = fallback
+            return fallback
 
 
     def append_image_to_response(self, response_text, rule_keywords=None):
