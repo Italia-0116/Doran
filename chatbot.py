@@ -422,8 +422,12 @@ class Chatbot:
                     return self.append_image_to_response(email_response)
 
             # 2. "Who can I contact?" / "contacts" → full directory
+            # Skip if position-specific query (e.g., "who is director") to allow NLU matching
+            position_keywords = ["director", "chairman", "dean", "head", "president", "vice", "professor", "instructor"]
+            is_position_query = any(pos in user_input.lower() for pos in position_keywords)
+            
             contact_keywords = ["contact", "who", "reach", "emails", "directory"]
-            if any(kw in tokens for kw in contact_keywords):
+            if any(kw in tokens for kw in contact_keywords) and not is_position_query:
                 all_emails = self.cached_emails
                 if all_emails:
                     response = "You can contact these offices:\n"
