@@ -318,100 +318,203 @@ with app.app_context():
     def auto_migrate_json_to_db():
         """
         Automatically migrate JSON files to database tables on startup if tables are empty.
-        Also fixes email_directory schema and populates sample emails.
-        Supports FORCE_MIGRATE env var (true/full) to force migration.
+        Inline migration functions for categories, faqs, locations, visuals, rules, emails.
         """
+        import json
+        import ast
+        
+        def retry_db_operation(operation, max_retries=3, delay=1):
+            import time
+            for attempt in range(max_retries):
+                try:
+                    return operation()
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        app.logger.warning(f"DB op failed (attempt {attempt + 1}): {str(e)}")
+                        time.sleep(delay * (2 ** attempt))
+                    else:
+                        app.logger.error(f"DB op failed after {max_retries} attempts: {str(e)}")
+                        raise
+
+        def migrate_categories(base_path):
+            categories_path = os.path.join(base_path, 'categories.json')
+            if os.path.exists(categories_path):
+                with open(categories_path, 'r', encoding='utf-8') as f:
+                    categories = json.load(f)
+                count = 0
+                for category in categories:
+                    existing = Category.query.filter_by(name=category).first()
+                    if not existing:
+                        new_cat = Category(name=category)
+                        db.session.add(new_cat)
+                        count += 1
+                db.session.commit()
+                app.logger.info(f"Migrated {count}/{len(categories)} categories")
+
+        def migrate_faqs(base_path):
+            def op():
+                faqs_path = os.path.join(base_path, 'faqs.json')
+                if os.path.exists(faqs_path):
+                    with open(faqs_path, 'r', encoding='utf-8') as f:
+                        faqs = json.load(f)
+                    count = 0
+                    for faq in faqs:
+                        existing = Faq.query.filter_by(question=faq.get('question', ''), answer=faq.get('answer', '')).first()
+                        if not existing:
+                            new_faq = Faq(question=faq.get('question', ''), answer=faq.get('answer', ''))
+                            db.session.add(new_faq)
+                            count += 1
+                    db.session.commit()
+                    app.logger.info(f"Migrated {count}/{len(faqs)} FAQs")
+            retry_db_operation(op)
+
+        def migrate_locations(base_path):
+            locations_path = os.path.join(base_path, 'locations', 'locations.json')
+            if os.path.exists(locations_path):
+                with open(locations_path, 'r', encoding='utf-8') as f:
+                    locations = json.load(f)
+                count = 0
+                for loc in locations:
+                    new_loc = Location(
+                        id=loc.get('id', ''),
+                        questions=loc.get('questions', []),
+                        description=loc.get('description', ''),
+                        user_type=loc.get('user_type', 'both'),
+                        urls=loc.get('urls', []),
+                        url=loc.get('url', '')
+                    )
+                    db.session.add(new_loc)
+                    count += 1
+                db.session.commit()
+                app.logger.info(f"Migrated {count} locations")
+
+        def migrate_visuals(base_path):
+            def op():
+                visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
+                if os.path.exists(visuals_path):
+                    with open(visuals_path, 'r', encoding='utf-8') as f:
+                        visuals = json.load(f)
+                    for vis in visuals:
+                        new_vis = Visual(
+                            id=vis.get('id', ''),
+                            questions=vis.get('questions', []),
+                            description=vis.get('description', ''),
+                            user_type=vis.get('user_type', 'both'),
+                            urls=vis.get('urls', []),
+                            url=vis.get('url', '')
+                        )
+                        db.session.add(new_vis)
+                    db.session.commit()
+                    app.logger.info(f"Migrated {len(visuals)} visuals")
+            retry_db_operation(op)
+
+        def migrate_rules(base_path):
+            # User rules
+            user_file = os.path.join(base_path, 'user_database', 'all_user_rules.json')
+            if os.path.exists(user_file):
+                with open(user_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                count = 0
+                for cat, rules in data.items():
+                    for rule in rules:
+                        new_rule = UserRule(category=cat.lower(), question=rule.get('question', ''), answer=rule.get('answer', ''))
+                        db.session.add(new_rule)
+                        count += 1
+                app.logger.info(f"Migrated {count} user rules")
+            
+            # Guest rules
+            guest_file = os.path.join(base_path, 'guest_database', 'all_guest_rules.json')
+            if os.path.exists(guest_file):
+                with open(guest_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                count = 0
+                for cat, rules in data.items():
+                    for rule in rules:
+                        new_rule = GuestRule(category=cat.lower(), question=rule.get('question', ''), answer=rule.get('answer', ''))
+                        db.session.add(new_rule)
+                        count += 1
+                app.logger.info(f"Migrated {count} guest rules")
+            db.session.commit()
+
+        def migrate_email_directory(base_path):
+            # Inline sample emails (migrate py file logic later if needed)
+            sample_emails = [
+                {"school": "SOICT", "email": "soict@wvsu.edu.ph"},
+                {"school": "Registrar", "email": "registrar@wvsu.edu.ph"},
+            ]
+            count = 0
+            for data in sample_emails:
+                existing = EmailDirectory.query.filter_by(email=data['email']).first()
+                if not existing:
+                    new_email = EmailDirectory(school=data['school'], email=data['email'])
+                    db.session.add(new_email)
+                    count += 1
+            if count > 0:
+                db.session.commit()
+                app.logger.info(f"Populated {count} sample emails")
+
         try:
             force_migrate = os.environ.get('FORCE_MIGRATE', 'false').lower() == 'true'
-            truncate_tables = os.environ.get('FORCE_MIGRATE', 'false').lower() == 'full'
+            app.logger.info(f"Auto-migrate started. FORCE_MIGRATE={force_migrate}")
 
-            app.logger.info(f"Auto-migrate started. FORCE_MIGRATE={os.environ.get('FORCE_MIGRATE', 'false')}, truncate={truncate_tables}")
+            from chatbot_models import Category, Faq, Location, Visual, UserRule, GuestRule, EmailDirectory
+            counts = {
+                'FAQ': db.session.query(Faq).count(),
+                'Locations': db.session.query(Location).count(),
+                'Visuals': db.session.query(Visual).count(),
+                'UserRules': db.session.query(UserRule).count(),
+                'GuestRules': db.session.query(GuestRule).count(),
+                'Emails': db.session.query(EmailDirectory).count()
+            }
+            app.logger.info(f"Current table counts: {counts}")
 
-            # First, fix email_directory schema if needed (MySQL only)
-            if user_db_url.startswith('mysql'):
-                from fix_database_schema import fix_email_directory_table
-                try:
-                    fix_email_directory_table(db.engine)
-                    app.logger.info("Email directory schema fix completed")
-                except Exception as e:
-                    app.logger.warning(f"Email directory schema fix failed (continuing): {str(e)}")
-            else:
-                app.logger.info("Using SQLite - skipping MySQL schema fixes")
-
-            # Check if chatbot database tables are empty
-            from chatbot_models import Faq, Location, Visual, UserRule, GuestRule, EmailDirectory
-            faq_count = db.session.query(Faq).count()
-            location_count = db.session.query(Location).count()
-            visual_count = db.session.query(Visual).count()
-            user_rule_count = db.session.query(UserRule).count()
-            guest_rule_count = db.session.query(GuestRule).count()
-            email_count = db.session.query(EmailDirectory).count()
-
-            app.logger.info(f"Current table counts - FAQ:{faq_count}, Locations:{location_count}, Visuals:{visual_count}, UserRules:{user_rule_count}, GuestRules:{guest_rule_count}, Emails:{email_count}")
-
-            should_migrate = force_migrate or (faq_count == 0 and location_count == 0 and visual_count == 0 and user_rule_count == 0 and guest_rule_count == 0)
+            should_migrate = force_migrate or all(v == 0 for v in counts.values() if v is not None)
 
             if should_migrate:
-                if force_migrate:
-                    app.logger.info("FORCE_MIGRATE enabled, proceeding with migration (truncate=" + str(truncate_tables) + ")")
-                else:
-                    app.logger.info("Database tables empty, running JSON to database migration...")
-
-                if truncate_tables:
-                    app.logger.info("TRUNCATE mode: Clearing all chatbot tables before migration")
-                    try:
-                        Faq.__table__.drop(db.engine, checkfirst=True)
-                        Location.__table__.drop(db.engine, checkfirst=True)
-                        Visual.__table__.drop(db.engine, checkfirst=True)
-                        UserRule.__table__.drop(db.engine, checkfirst=True)
-                        GuestRule.__table__.drop(db.engine, checkfirst=True)
-                        Category.__table__.drop(db.engine, checkfirst=True)
-                        db.create_all()
-                        app.logger.info("Tables truncated and recreated")
-                    except Exception as e:
-                        app.logger.error(f"Table truncate failed: {e}")
-                        return
-
-                app.logger.info("Using tables from db.create_all(), skipping redundant creation")
-
-                # Determine the correct base path - use volume if mounted, otherwise local
+                app.logger.info("Running JSON → DB migration...")
+                
+                # Base path logic
                 volume_path = '/app/database'
-                local_db_path = os.path.join(app.root_path, 'database')
+                base_path = volume_path if os.path.exists(volume_path) else os.path.join(app.root_path, 'database')
+                app.logger.info(f"Migration base_path: {base_path}")
 
-                # Use volume path if it exists and is readable, otherwise use local path
-                if os.path.exists(volume_path) and os.access(volume_path, os.R_OK):
-                    base_path = volume_path
-                    app.logger.info(f"Using Railway volume path for migration: {base_path}")
-                else:
-                    base_path = local_db_path
-                    app.logger.info(f"Using local database path for migration: {base_path}")
-
-                # Check key JSON files
-                faqs_path = os.path.join(base_path, 'faqs.json')
-                locations_path = os.path.join(base_path, 'locations', 'locations.json')
-                visuals_path = os.path.join(base_path, 'visuals', 'visuals.json')
-                categories_path = os.path.join(base_path, 'categories.json')
-                user_rules_path = os.path.join(base_path, 'user_database', 'all_user_rules.json')
-                guest_rules_path = os.path.join(base_path, 'guest_database', 'all_guest_rules.json')
-
-                file_exists = {
-                    'categories.json': os.path.exists(categories_path),
-                    'faqs.json': os.path.exists(faqs_path),
-                    'locations.json': os.path.exists(locations_path),
-                    'visuals.json': os.path.exists(visuals_path),
-                    'user_rules.json': os.path.exists(user_rules_path),
-                    'guest_rules.json': os.path.exists(guest_rules_path)
-                }
-                app.logger.info(f"JSON files found: {file_exists}")
-
-                if not any(file_exists.values()):
-                    app.logger.warning("No JSON files found at base_path, skipping migration")
-                    return
-
-                # TEMP: Skip migrations until functions defined - just log
-                app.logger.info("Migration functions pending - skipping data load for now")
+                # EXECUTE MIGRATIONS
+                migrate_categories(base_path)
+                migrate_faqs(base_path)
+                migrate_locations(base_path)
+                migrate_visuals(base_path)
+                migrate_rules(base_path)
+                migrate_email_directory(base_path)
+                
+                # Reload chatbot data
+                try:
+                    chatbot.reload_faqs()
+                    chatbot.reload_location_rules()
+                    chatbot.reload_visual_rules()
+                except:
+                    pass
+                
+                app.logger.info("✅ All migrations completed")
             else:
-                app.logger.info("Database tables contain data and no force migrate, skipping migration")
+                app.logger.info("Tables populated, skipping migration")
+
+            # Final counts - simplified
+            app.logger.info(f"Final FAQ count: {db.session.query(Faq).count()}")
+            app.logger.info(f"Final Location count: {db.session.query(Location).count()}")
+            app.logger.info(f"Final Visual count: {db.session.query(Visual).count()}")
+
+        except Exception as e:
+            app.logger.error(f"Migration error: {str(e)}")
+            db.session.rollback()
+
+            # Execute migrations
+            migrate_categories(base_path)
+            migrate_email_directory(base_path)
+            migrate_faqs(base_path)
+            migrate_locations(base_path)
+            migrate_visuals(base_path)
+            migrate_rules(base_path)
+            app.logger.info("All JSON migrations completed successfully")
 
             # Always populate email directory if empty, regardless of other tables
             if email_count == 0:
