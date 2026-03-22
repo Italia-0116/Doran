@@ -243,8 +243,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const categorySections = activeContainer.querySelectorAll('.category-section');
 
         categorySections.forEach(section => {
-            // Skip sections hidden by category filter
-            if (section.style.display === 'none') return;
+            // When searching, respect category filter; when cleared, show all sections
+            if (searchValue && section.style.display === 'none') return;
 
             const rows = section.querySelectorAll('tbody tr');
             let sectionHasVisibleRows = false;
@@ -280,8 +280,17 @@ document.addEventListener('DOMContentLoaded', function() {
             });
 
             // Show/hide the entire category section based on whether it has visible rows
-            section.style.display = sectionHasVisibleRows ? 'block' : 'none';
+            // When no search, always show sections with rows
+            section.style.display = sectionHasVisibleRows ? 'block' : (searchValue ? 'none' : 'block');
         });
+
+        // When search cleared, reset category filter to 'all'
+        if (!searchValue) {
+            const categoryFilter = document.getElementById('category-filter');
+            if (categoryFilter) {
+                categoryFilter.value = 'all';
+            }
+        }
     }
 
     // Add search event listeners with debouncing
