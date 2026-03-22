@@ -23,26 +23,44 @@ def get_database_urls():
     mysql_env_vars = {k: v for k, v in os.environ.items() if 'mysql' in k.lower() or 'database' in k.lower()}
     print(f"Available MySQL/Database environment variables: {mysql_env_vars}")
 
-    def construct_railway_mysql_url():
-        """Construct MySQL URL strictly from Railway env vars"""
-        host = safe_get_env('MYSQLHOST') or safe_get_env('MYSQL_HOST')
-        port_str = safe_get_env('MYSQLPORT') or safe_get_env('MYSQL_PORT')
-        user = safe_get_env('MYSQLUSER') or safe_get_env('MYSQL_USER')
-        password = safe_get_env('MYSQLPASSWORD') or safe_get_env('MYSQL_ROOT_PASSWORD')
-        db_name = safe_get_env('MYSQLDATABASE') or safe_get_env('MYSQL_DATABASE') or 'railway'
+def construct_railway_mysql_url():
+    """Construct MySQL URL from Railway environment variables with improved detection"""
+    # Comprehensive Railway var detection
+    host = (safe_get_env('MYSQLHOST') or 
+            safe_get_env('MYSQL_HOST') or 
+            safe_get_env('DATABASE_HOST'))
+    port_str = (safe_get_env('MYSQLPORT') or 
+                safe_get_env('MYSQL_PORT') or 
+                safe_get_env('DATABASE_PORT', '3306'))
+    user = (safe_get_env('MYSQLUSER') or 
+            safe_get_env('MYSQL_USER') or 
+            safe_get_env('DATABASE_USER'))
+    password = (safe_get_env('MYSQLPASSWORD') or 
+                safe_get_env('MYSQL_ROOT_PASSWORD') or 
+                safe_get_env('DATABASE_PASSWORD'))
+    db_name = (safe_get_env('MYSQLDATABASE') or 
+               safe_get_env('MYSQL_DATABASE') or 
+               safe_get_env('DATABASE_NAME') or 'railway')
 
-        if not all([host, port_str, user, password]):
-            print("Missing required Railway MySQL env vars")
-            return None
+    if not all([host, port_str, user, password]):
+        print(f"Missing Railway MySQL vars: host={bool(host)}, port={bool(port_str)}, user={bool(user)}, pw={bool(password)}")
+        return None
 
-        port = int(port_str)
-        # Use proxy for internal hosts if needed
-        if 'railway.internal' in host:
-            host = 'hopper.proxy.rlwy.net'  # Use public proxy from MYSQL_PUBLIC_URL
+    port = int(port_str)
+    
+    # Enhanced proxy routing for Railway internal/external
+    original_host = host
+    if 'railway.internal' in host.lower() or host.startswith('127.') or '::1' in host:
+        # Internal IPv6/Localhost → use public proxy
+        host = safe_get_env('MYSQL_PROXY_HOST', 'hopper.proxy.rlwy.net')
+        port = int(safe_get_env('MYSQL_PROXY_PORT', '10123'))
+        print(f"Internal host {original_host} → proxy {host}:{port}")
 
-        url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4'
-        print(f"Constructed MySQL URL: {user}:***@{host}:{port}/{db_name}")
-        return url
+    # Add SSL params to connection string for Railway
+    ssl_params = "ssl_disabled=0&ssl_verify_cert=0&ssl_verify_identity=0"
+    url = f'mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}?charset=utf8mb4&{ssl_params}'
+    print(f"MySQL URL: {user}:***@{host}:{port}/{db_name} (from {original_host})")
+    return url
 
     mysql_url = construct_railway_mysql_url()
     if mysql_url:
@@ -65,12 +83,15 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'max_overflow': 0,
     'pool_timeout': 30,
     'connect_args': {
-        'connect_timeout': 30,
+        'connection_timeout': 30,
         'read_timeout': 30,
         'write_timeout': 30,
         'autocommit': True,
         'charset': 'utf8mb4',
         'init_command': 'SET SESSION sql_mode="STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"',
+        'ssl_disabled': False,
+        'ssl_verify_cert': False,
+        'ssl_verify_identity': False,
     }
 }
 
