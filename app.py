@@ -517,6 +517,8 @@ with app.app_context():
             app.logger.info("All JSON migrations completed successfully")
 
             # Always populate email directory if empty, regardless of other tables
+            from chatbot_models import EmailDirectory
+            email_count = db.session.query(EmailDirectory).count()
             if email_count == 0:
                 app.logger.info("Email directory is empty, populating with sample data...")
                 try:
